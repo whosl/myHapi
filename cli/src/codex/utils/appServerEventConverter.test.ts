@@ -709,4 +709,41 @@ describe('AppServerEventConverter', () => {
         ]);
     });
 
+    it('maps serverRequest/expired notifications', () => {
+        const converter = new AppServerEventConverter();
+        const events = converter.handleNotification('serverRequest/expired', {
+            requestId: 'req-123'
+        });
+
+        expect(events).toEqual([{ type: 'permission_expired', request_id: 'req-123' }]);
+    });
+
+    it('maps serverRequest/autoResolved notifications', () => {
+        const converter = new AppServerEventConverter();
+        const events = converter.handleNotification('serverRequest/autoResolved', {
+            id: 'req-456'
+        });
+
+        expect(events).toEqual([{ type: 'permission_expired', request_id: 'req-456' }]);
+    });
+
+    it('maps windowsSandbox/setupComplete notifications', () => {
+        const converter = new AppServerEventConverter();
+        const events = converter.handleNotification('windowsSandbox/setupComplete', {
+            sandboxId: 'sandbox-1',
+            success: true
+        });
+
+        expect(events).toEqual([{ type: 'sandbox_setup_complete', sandbox_id: 'sandbox-1', success: true }]);
+    });
+
+    it('maps windowsSandbox/setupError notifications', () => {
+        const converter = new AppServerEventConverter();
+        const events = converter.handleNotification('windowsSandbox/setupError', {
+            error: 'Failed to create sandbox'
+        });
+
+        expect(events).toEqual([{ type: 'sandbox_setup_error', error: 'Failed to create sandbox' }]);
+    });
+
 });

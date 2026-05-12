@@ -40,12 +40,9 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
     logger.debugLargeJson('[START] HAPI process started', getEnvironmentInfo());
     logger.debug(`[START] Options: startedBy=${startedBy}, startingMode=${options.startingMode}`);
 
-    // Validate runner spawn requirements
-    if (startedBy === 'runner' && options.startingMode === 'local') {
-        logger.debug('Runner spawn requested with local mode - forcing remote mode');
-        options.startingMode = 'remote';
-        // TODO: Eventually we should error here instead of silently switching
-        // throw new Error('Runner-spawned sessions cannot use local/interactive mode');
+    // Runner-spawned sessions can use local mode (required for non-standard API providers)
+    if (startedBy === 'runner' && !options.startingMode) {
+        options.startingMode = 'local';
     }
 
     const initialState: AgentState = {};

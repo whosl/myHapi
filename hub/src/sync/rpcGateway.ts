@@ -195,6 +195,22 @@ export class RpcGateway {
         return result as RpcListDirectoryResponse
     }
 
+    async listClaudeSessions(machineId: string, workingDirectory: string): Promise<{ success: boolean; sessions?: Array<{ sessionId: string; lastModified: number; size: number; cwd: string }>; error?: string }> {
+        const result = await this.machineRpc(machineId, 'list-claude-sessions', { workingDirectory })
+        if (!result || typeof result !== 'object') {
+            return { success: false, error: 'Unexpected list-claude-sessions result' }
+        }
+        return result as { success: boolean; sessions?: Array<{ sessionId: string; lastModified: number; size: number; cwd: string }>; error?: string }
+    }
+
+    async listCodexSessions(machineId: string, workingDirectory: string): Promise<{ success: boolean; sessions?: Array<{ sessionId: string; lastModified: number; size: number; cwd: string }>; error?: string }> {
+        const result = await this.machineRpc(machineId, 'list-codex-sessions', { workingDirectory })
+        if (!result || typeof result !== 'object') {
+            return { success: false, error: 'Unexpected list-codex-sessions result' }
+        }
+        return result as { success: boolean; sessions?: Array<{ sessionId: string; lastModified: number; size: number; cwd: string }>; error?: string }
+    }
+
     async checkPathsExist(machineId: string, paths: string[]): Promise<Record<string, boolean>> {
         const result = await this.machineRpc(machineId, 'path-exists', { paths }) as RpcPathExistsResponse | unknown
         if (!result || typeof result !== 'object') {

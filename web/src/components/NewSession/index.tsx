@@ -3,6 +3,8 @@ import type { ApiClient } from '@/api/client'
 import type { Machine } from '@/types/api'
 import { usePlatform } from '@/hooks/usePlatform'
 import { useMachinePathsExists } from '@/hooks/useMachinePathsExists'
+import { useClaudeSessions } from '@/hooks/queries/useClaudeSessions'
+import { useCodexSessions } from '@/hooks/queries/useCodexSessions'
 import { useSpawnSession } from '@/hooks/mutations/useSpawnSession'
 import { useCodexModels } from '@/hooks/queries/useCodexModels'
 import { useOpencodeModelsForCwd } from '@/hooks/queries/useOpencodeModelsForCwd'
@@ -59,6 +61,7 @@ export function NewSession(props: {
     const [yoloMode, setYoloMode] = useState(loadPreferredYoloMode)
     const [sessionType, setSessionType] = useState<SessionType>('simple')
     const [worktreeName, setWorktreeName] = useState('')
+    const [resumeSessionId, setResumeSessionId] = useState('')
     const [directoryCreationConfirmed, setDirectoryCreationConfirmed] = useState(false)
     const [error, setError] = useState<string | null>(null)
     const worktreeInputRef = useRef<HTMLInputElement>(null)
@@ -136,6 +139,20 @@ export function NewSession(props: {
     const trimmedDirectory = directory.trim()
     const deferredDirectory = useDeferredValue(trimmedDirectory)
     const allPaths = useDirectorySuggestions(machineId, sessions, recentPaths)
+
+    const { sessions: claudeSessions, isLoading: isLoadingClaudeSessions } = useClaudeSessions({
+        api: props.api,
+        machineId,
+        workingDirectory: trimmedDirectory,
+        enabled: agent === 'claude' && Boolean(machineId) && trimmedDirectory.length > 0
+    })
+
+    const { sessions: codexSessions, isLoading: isLoadingCodexSessions } = useCodexSessions({
+        api: props.api,
+        machineId,
+        workingDirectory: trimmedDirectory,
+        enabled: agent === 'codex' && Boolean(machineId) && trimmedDirectory.length > 0
+    })
 
     const pathsToCheck = useMemo(
         () => Array.from(new Set([
@@ -301,8 +318,22 @@ export function NewSession(props: {
 
         setError(null)
         try {
-            const existsResult = await checkPathsExists([trimmedDirectory])
-            const directoryExists = existsResult[trimmedDirectory]
+            // When resuming, prefer the session's original cwd over the directory field
+            let effectiveDirectory = trimmedDirectory
+            const resumeId = resumeSessionId.trim()
+            if (resumeId) {
+                const resumeSession = agent === 'claude'
+                    ? claudeSessions.find(s => s.sessionId === resumeId)
+                    : agent === 'codex'
+                    ? codexSessions.find(s => s.sessionId === resumeId)
+                    : null
+                if (resumeSession?.cwd) {
+                    effectiveDirectory = resumeSession.cwd
+                }
+            }
+
+            const existsResult = await checkPathsExists([effectiveDirectory])
+            const directoryExists = existsResult[effectiveDirectory]
 
             if (sessionType === 'worktree' && directoryExists === false) {
                 haptic.notification('error')
@@ -324,20 +355,36 @@ export function NewSession(props: {
                 : undefined
             const result = await spawnSession({
                 machineId,
-                directory: trimmedDirectory,
+                directory: effectiveDirectory,
                 agent,
                 model: resolvedModel,
                 effort: resolvedEffort,
                 modelReasoningEffort: resolvedModelReasoningEffort,
                 yolo: yoloMode,
                 sessionType,
-                worktreeName: sessionType === 'worktree' ? (worktreeName.trim() || undefined) : undefined
+                worktreeName: sessionType === 'worktree' ? (worktreeName.trim() || undefined) : undefined,
+                resumeSessionId: resumeSessionId.trim() || undefined,
             })
 
             if (result.type === 'success') {
                 haptic.notification('success')
                 setLastUsedMachineId(machineId)
-                addRecentPath(machineId, trimmedDirectory)
+                addRecentPath(machineId, effectiveDirectory)
+
+                // Auto-import Claude session history when resuming
+                if (resumeId && agent === 'claude') {
+                    props.api.importClaudeHistory(result.sessionId, resumeId, effectiveDirectory).catch(() => {
+                        // Import failure is non-blocking — the session still works
+                    })
+                }
+
+                // Auto-import Codex session history when resuming
+                if (resumeId && agent === 'codex') {
+                    props.api.importCodexHistory(result.sessionId, resumeId, effectiveDirectory).catch(() => {
+                        // Import failure is non-blocking — the session still works
+                    })
+                }
+
                 props.onSuccess(result.sessionId)
                 return
             }
@@ -437,6 +484,85 @@ export function NewSession(props: {
                 isDisabled={isFormDisabled}
                 onToggle={setYoloMode}
             />
+            {agent === 'claude' && trimmedDirectory && claudeSessions.length > 0 && (
+                <div className="flex flex-col gap-1 px-3 py-2">
+                    <label className="text-xs font-medium text-[var(--app-text-secondary)]">
+                        Resume Session (optional — history will be imported)
+                    </label>
+                    <select
+                        value={resumeSessionId}
+                        onChange={(e) => {
+                            const id = e.target.value
+                            setResumeSessionId(id)
+                            if (id) {
+                                const s = claudeSessions.find((s) => s.sessionId === id)
+                                if (s?.cwd) setDirectory(s.cwd)
+                            }
+                        }}
+                        disabled={isFormDisabled}
+                        className="w-full rounded-md border border-[var(--app-border)] bg-transparent px-2 py-1.5 text-sm text-[var(--app-text-primary)] disabled:opacity-50"
+                    >
+                        <option value="">New session (no resume)</option>
+                        {claudeSessions.map((s) => (
+                            <option key={s.sessionId} value={s.sessionId}>
+                                {s.sessionId.slice(0, 8)}... ({formatSessionSize(s.size)}, {formatSessionTime(s.lastModified)})
+                            </option>
+                        ))}
+                    </select>
+                </div>
+            )}
+            {agent === 'claude' && trimmedDirectory && isLoadingClaudeSessions && (
+                <div className="px-3 py-2 text-xs text-[var(--app-hint)]">
+                    Loading sessions...
+                </div>
+            )}
+            {agent === 'codex' && trimmedDirectory && codexSessions.length > 0 && (
+                <div className="flex flex-col gap-1 px-3 py-2">
+                    <label className="text-xs font-medium text-[var(--app-text-secondary)]">
+                        Resume Codex Session (optional — history will be imported)
+                    </label>
+                    <select
+                        value={resumeSessionId}
+                        onChange={(e) => {
+                            const id = e.target.value
+                            setResumeSessionId(id)
+                            if (id) {
+                                const s = codexSessions.find((s) => s.sessionId === id)
+                                if (s?.cwd) setDirectory(s.cwd)
+                            }
+                        }}
+                        disabled={isFormDisabled}
+                        className="w-full rounded-md border border-[var(--app-border)] bg-transparent px-2 py-1.5 text-sm text-[var(--app-text-primary)] disabled:opacity-50"
+                    >
+                        <option value="">New session (no resume)</option>
+                        {codexSessions.map((s) => (
+                            <option key={s.sessionId} value={s.sessionId}>
+                                {s.sessionId.slice(0, 8)}... ({formatSessionSize(s.size)}, {formatSessionTime(s.lastModified)})
+                            </option>
+                        ))}
+                    </select>
+                </div>
+            )}
+            {agent === 'codex' && trimmedDirectory && isLoadingCodexSessions && (
+                <div className="px-3 py-2 text-xs text-[var(--app-hint)]">
+                    Loading Codex sessions...
+                </div>
+            )}
+            {(agent === 'cursor' || agent === 'gemini' || agent === 'opencode' || (agent === 'codex' && trimmedDirectory && !isLoadingCodexSessions && codexSessions.length === 0)) && (
+                <div className="flex flex-col gap-1 px-3 py-2">
+                    <label className="text-xs font-medium text-[var(--app-text-secondary)]">
+                        Resume Session ID (optional)
+                    </label>
+                    <input
+                        type="text"
+                        value={resumeSessionId}
+                        onChange={(e) => setResumeSessionId(e.target.value)}
+                        disabled={isFormDisabled}
+                        placeholder="Paste session ID to resume..."
+                        className="w-full rounded-md border border-[var(--app-border)] bg-transparent px-2 py-1.5 text-sm text-[var(--app-text-primary)] placeholder:text-[var(--app-hint)] disabled:opacity-50"
+                    />
+                </div>
+            )}
 
             {(error ?? spawnError) ? (
                 <div className="px-3 py-2 text-sm text-red-600">
@@ -454,4 +580,21 @@ export function NewSession(props: {
             />
         </div>
     )
+}
+
+function formatSessionSize(bytes: number): string {
+    if (bytes < 1024) return `${bytes}B`
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`
+    return `${(bytes / (1024 * 1024)).toFixed(1)}MB`
+}
+
+function formatSessionTime(ts: number): string {
+    const d = new Date(ts)
+    const now = new Date()
+    const diffMs = now.getTime() - d.getTime()
+    const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24))
+    if (diffDays === 0) return `today ${d.getHours()}:${String(d.getMinutes()).padStart(2, '0')}`
+    if (diffDays === 1) return 'yesterday'
+    if (diffDays < 7) return `${diffDays}d ago`
+    return `${d.getMonth() + 1}/${d.getDate()}`
 }

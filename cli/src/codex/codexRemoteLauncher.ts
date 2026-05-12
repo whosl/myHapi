@@ -17,6 +17,7 @@ import { registerAppServerPermissionHandlers } from './utils/appServerPermission
 import { buildThreadStartParams, buildTurnStartParams } from './utils/appServerConfig';
 import { shouldIgnoreTerminalEvent } from './utils/terminalEventGuard';
 import { parseCodexSpecialCommand } from './codexSpecialCommands';
+import { setCodexAppServerClient } from '@/api/codexSessionCache';
 import {
     RemoteLauncherBase,
     type RemoteLauncherDisplayContext,
@@ -2031,6 +2032,8 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             }
         });
 
+        setCodexAppServerClient(appServerClient);
+
         let hasThread = false;
         let pending: QueuedMessage | null = null;
 
@@ -2152,6 +2155,60 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 return true;
             }
 
+            if (specialCommand.type === 'fork') {
+                if (!this.currentThreadId) {
+                    sendVisibleStatus('No active thread to fork');
+                    return true;
+                }
+                if (!appServerClient.hasCapability('thread/fork')) {
+                    sendVisibleStatus('Fork is not supported by the installed Codex version');
+                    return true;
+                }
+                sendVisibleStatus('Forking thread...');
+                try {
+                    const forkResponse = await appServerClient.forkThread({
+                        threadId: this.currentThreadId,
+                        cwd: session.path,
+                    }, { signal: this.abortController.signal });
+                    const newThreadId = forkResponse.thread?.id;
+                    if (newThreadId) {
+                        this.currentThreadId = newThreadId;
+                        hasThread = true;
+                        invalidThreadId = null;
+                        session.onSessionFound(newThreadId);
+                        const parent = forkResponse.thread?.forkedFromId;
+                        sendVisibleStatus(`Forked to new thread ${newThreadId.slice(0, 8)}${parent ? ` from ${parent.slice(0, 8)}` : ''}`);
+                    }
+                } catch (error) {
+                    const detail = error instanceof Error ? error.message : String(error);
+                    sendVisibleStatus(`Fork failed: ${detail}`);
+                }
+                return true;
+            }
+
+            if (specialCommand.type === 'rollback') {
+                if (!this.currentThreadId) {
+                    sendVisibleStatus('No active thread to rollback');
+                    return true;
+                }
+                if (!appServerClient.hasCapability('thread/rollback')) {
+                    sendVisibleStatus('Rollback is not supported by the installed Codex version');
+                    return true;
+                }
+                sendVisibleStatus('Rolling back thread...');
+                try {
+                    await appServerClient.rollbackThread({
+                        threadId: this.currentThreadId,
+                        numTurns: specialCommand.numTurns ?? 1,
+                    }, { signal: this.abortController.signal });
+                    sendVisibleStatus('Thread rolled back successfully');
+                } catch (error) {
+                    const detail = error instanceof Error ? error.message : String(error);
+                    sendVisibleStatus(`Rollback failed: ${detail}`);
+                }
+                return true;
+            }
+
             await interruptActiveTurn();
             resetCurrentTurnState();
             const threadId = await resumeExistingThreadForCompact(message.mode);
@@ -2175,6 +2232,27 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
 
         while (!this.shouldExit) {
             logActiveHandles('loop-top');
+            if (!pending && turnInFlight && session.queue.size() > 0 && this.currentThreadId && this.currentTurnId) {
+                if (appServerClient.hasCapability('turn/steer')) {
+                    try {
+                        const headMessage = session.queue.queue[0];
+                        if (headMessage) {
+                            session.queue.queue.shift();
+                            messageBuffer.addMessage(headMessage.message, 'user');
+                            await appServerClient.steerTurn({
+                                threadId: this.currentThreadId,
+                                expectedTurnId: this.currentTurnId ?? '',
+                                input: [{ type: 'text', text: headMessage.message }]
+                            });
+                            logger.debug('[Codex] turn/steer: sent input to active turn');
+                            continue;
+                        }
+                    } catch (error) {
+                        logger.debug('[Codex] turn/steer failed, queuing message for next turn', error);
+                    }
+                }
+            }
+
             if (!pending && (turnInFlight || recoveryInFlight) && session.queue.size() === 0) {
                 await waitForTurnOrRecovery(this.abortController.signal);
                 if (this.abortController.signal.aborted && !this.shouldExit) {
@@ -2272,6 +2350,16 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     this.currentThreadId = threadId;
                     session.onSessionFound(threadId);
                     hasThread = true;
+
+                    // Attempt explicit sandbox setup on Windows
+                    if (process.platform === 'win32' && appServerClient.hasCapability('windowsSandbox/setupStart') && threadId) {
+                        try {
+                            await appServerClient.startWindowsSandboxSetup({ mode: 'elevated', cwd: session.path });
+                            logger.debug('[Codex] Windows sandbox setup started for thread', threadId);
+                        } catch (error) {
+                            logger.debug('[Codex] Windows sandbox setup failed; continuing without explicit sandbox', error);
+                        }
+                    }
                 } else {
                     if (!this.currentThreadId) {
                         logger.debug('[Codex] Missing thread id; restarting app-server thread');
@@ -2353,6 +2441,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
 
     protected async cleanup(): Promise<void> {
         logger.debug('[codex-remote]: cleanup start');
+        setCodexAppServerClient(null);
         try {
             await this.appServerClient.disconnect();
         } catch (error) {

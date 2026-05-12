@@ -11,6 +11,7 @@ import { hookForwarderCommand } from './hookForwarder'
 import { mcpCommand } from './mcp'
 import { notifyCommand } from './notify'
 import { hubCommand } from './hub'
+import { proxyCommand } from './proxy'
 import type { CommandContext, CommandDefinition } from './types'
 
 const COMMANDS: CommandDefinition[] = [
@@ -26,7 +27,8 @@ const COMMANDS: CommandDefinition[] = [
     hookForwarderCommand,
     doctorCommand,
     runnerCommand,
-    notifyCommand
+    notifyCommand,
+    proxyCommand
 ]
 
 const commandMap = new Map<string, CommandDefinition>()

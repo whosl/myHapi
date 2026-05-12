@@ -9,7 +9,9 @@ function createClient() {
         client: {
             registerRequestHandler(method: string, handler: (params: unknown) => Promise<unknown> | unknown) {
                 handlers.set(method, handler);
-            }
+            },
+            hasCapability() { return false; },
+            resolveServerRequest() { return Promise.resolve({ ok: true }); }
         },
         handlers
     };

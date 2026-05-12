@@ -15,6 +15,7 @@ import type { SSEManager } from '../sse/sseManager'
 import { EventPublisher, type SyncEventListener } from './eventPublisher'
 import { MachineCache, type Machine } from './machineCache'
 import { MessageService } from './messageService'
+import { findCodexSessionPath } from './codexSessionCache'
 import {
     RpcGateway,
     type RpcCodexModel,
@@ -56,6 +57,7 @@ export class SyncEngine {
     private readonly machineCache: MachineCache
     private readonly messageService: MessageService
     private readonly rpcGateway: RpcGateway
+    private readonly store: Store
     private inactivityTimer: NodeJS.Timeout | null = null
 
     constructor(
@@ -64,6 +66,7 @@ export class SyncEngine {
         rpcRegistry: RpcRegistry,
         sseManager: SSEManager
     ) {
+        this.store = store
         this.eventPublisher = new EventPublisher(sseManager, (event) => this.resolveNamespace(event))
         this.sessionCache = new SessionCache(store, this.eventPublisher)
         this.machineCache = new MachineCache(store, this.eventPublisher)
@@ -359,6 +362,229 @@ export class SyncEngine {
         await this.sessionCache.deleteSession(sessionId)
     }
 
+    async importClaudeHistory(
+        sessionId: string,
+        claudeSessionId: string,
+        workingDirectory: string
+    ): Promise<{ imported: number }> {
+        const { resolve } = await import('node:path')
+        const { readFile } = await import('node:fs/promises')
+        const { homedir } = await import('node:os')
+
+        const projectId = resolve(workingDirectory).replace(/[^a-zA-Z0-9]/g, '-')
+        const claudeConfigDir = process.env.CLAUDE_CONFIG_DIR || resolve(homedir(), '.claude')
+        const jsonlPath = resolve(claudeConfigDir, 'projects', projectId, `${claudeSessionId}.jsonl`)
+
+        let fileContent: string
+        try {
+            fileContent = await readFile(jsonlPath, 'utf-8')
+        } catch {
+            throw new Error(`Claude session file not found: ${jsonlPath}`)
+        }
+
+        const INTERNAL_TYPES = new Set(['file-history-snapshot', 'change', 'queue-operation'])
+        const VISIBLE_SYSTEM_SUBTYPES = new Set(['init', 'result', 'error', 'success'])
+        const lines = fileContent.split('\n')
+        let imported = 0
+
+        for (const line of lines) {
+            const trimmed = line.trim()
+            if (!trimmed) continue
+
+            let parsed: any
+            try { parsed = JSON.parse(trimmed) } catch { continue }
+
+            if (parsed.type && INTERNAL_TYPES.has(parsed.type)) continue
+
+            const type = parsed.type
+            if (type !== 'user' && type !== 'assistant' && type !== 'summary' && type !== 'system') continue
+
+            // Filter invisible messages
+            if (type === 'system') {
+                const subtype = parsed.subtype
+                if (subtype && !VISIBLE_SYSTEM_SUBTYPES.has(subtype) && subtype !== 'plan_mode_enter' && subtype !== 'plan_mode_exit') continue
+            }
+            if (type === 'user' && parsed.isMeta === true) continue
+            if (type === 'summary') continue
+
+            // Convert to HAPI message content
+            const isExternalUser = type === 'user'
+                && typeof parsed.message?.content === 'string'
+                && parsed.isSidechain !== true
+                && parsed.isMeta !== true
+
+            let content: any
+            if (isExternalUser) {
+                content = {
+                    role: 'user',
+                    content: { type: 'text', text: parsed.message.content },
+                    meta: { sentFrom: 'imported' }
+                }
+            } else {
+                content = {
+                    role: 'agent',
+                    content: { type: 'output', data: parsed },
+                    meta: { sentFrom: 'imported' }
+                }
+            }
+
+            this.store.messages.addMessage(sessionId, content)
+            imported++
+        }
+
+        return { imported }
+    }
+
+    async importCodexHistory(
+        sessionId: string,
+        codexSessionId: string,
+        _workingDirectory: string
+    ): Promise<{ imported: number }> {
+        const { join } = await import('node:path')
+        const { readFile } = await import('node:fs/promises')
+        const { homedir } = await import('node:os')
+        const { randomUUID } = await import('node:crypto')
+
+        const codexHome = process.env.CODEX_HOME || join(homedir(), '.codex')
+        const sessionsRoot = join(codexHome, 'sessions')
+
+        const jsonlPath = await this.findCodexSessionFile(sessionsRoot, codexSessionId)
+
+        let fileContent: string
+        try {
+            fileContent = await readFile(jsonlPath, 'utf-8')
+        } catch {
+            throw new Error(`Codex session file not found for session: ${codexSessionId}`)
+        }
+
+        const SKIP_TYPES = new Set([
+            'session_meta', 'turn_context', 'agent_reasoning',
+            'agent_reasoning_delta', 'token_count', 'reasoning'
+        ])
+
+        const lines = fileContent.split('\n')
+        let imported = 0
+
+        for (const line of lines) {
+            const trimmed = line.trim()
+            if (!trimmed) continue
+
+            let parsed: any
+            try { parsed = JSON.parse(trimmed) } catch { continue }
+
+            if (SKIP_TYPES.has(parsed.type)) continue
+
+            let content: any = null
+
+            if (parsed.type === 'event_msg') {
+                const pt = parsed.payload?.type
+                if (pt === 'user_message') {
+                    const text = parsed.payload.message ?? parsed.payload.text ?? ''
+                    if (!text) continue
+                    content = {
+                        role: 'user',
+                        content: { type: 'text', text },
+                        meta: { sentFrom: 'imported' }
+                    }
+                } else if (pt === 'agent_message' && parsed.payload.phase === 'final') {
+                    const msg = parsed.payload.message ?? ''
+                    if (!msg) continue
+                    content = {
+                        role: 'agent',
+                        content: { type: 'codex', data: { type: 'message', message: msg, id: randomUUID() } },
+                        meta: { sentFrom: 'imported' }
+                    }
+                } else if (pt === 'agent_reasoning') {
+                    const msg = parsed.payload.text ?? parsed.payload.message ?? ''
+                    if (!msg) continue
+                    content = {
+                        role: 'agent',
+                        content: { type: 'codex', data: { type: 'reasoning', message: msg, id: randomUUID() } },
+                        meta: { sentFrom: 'imported' }
+                    }
+                } else {
+                    continue
+                }
+            } else if (parsed.type === 'response_item') {
+                const pt = parsed.payload?.type
+                if (pt === 'message') {
+                    const role = parsed.payload.role
+                    if (role === 'user') {
+                        const text = Array.isArray(parsed.payload.content)
+                            ? parsed.payload.content.filter((c: any) => c.type === 'input_text').map((c: any) => c.text).join('\n')
+                            : ''
+                        if (!text) continue
+                        content = {
+                            role: 'user',
+                            content: { type: 'text', text },
+                            meta: { sentFrom: 'imported' }
+                        }
+                    } else if (role === 'assistant') {
+                        const text = Array.isArray(parsed.payload.content)
+                            ? parsed.payload.content.filter((c: any) => c.type === 'output_text').map((c: any) => c.text).join('\n')
+                            : ''
+                        if (!text) continue
+                        content = {
+                            role: 'agent',
+                            content: { type: 'codex', data: { type: 'message', message: text, id: randomUUID() } },
+                            meta: { sentFrom: 'imported' }
+                        }
+                    } else {
+                        continue
+                    }
+                } else if (pt === 'function_call') {
+                    content = {
+                        role: 'agent',
+                        content: {
+                            type: 'codex',
+                            data: {
+                                type: 'tool-call',
+                                name: parsed.payload.name,
+                                callId: parsed.payload.call_id,
+                                input: parsed.payload.arguments,
+                                id: randomUUID()
+                            }
+                        },
+                        meta: { sentFrom: 'imported' }
+                    }
+                } else if (pt === 'function_call_output') {
+                    content = {
+                        role: 'agent',
+                        content: {
+                            type: 'codex',
+                            data: {
+                                type: 'tool-call-result',
+                                callId: parsed.payload.call_id,
+                                output: parsed.payload.output,
+                                id: randomUUID()
+                            }
+                        },
+                        meta: { sentFrom: 'imported' }
+                    }
+                } else {
+                    continue
+                }
+            } else {
+                continue
+            }
+
+            if (content) {
+                this.store.messages.addMessage(sessionId, content)
+                imported++
+            }
+        }
+
+        return { imported }
+    }
+
+    private async findCodexSessionFile(_sessionsRoot: string, codexSessionId: string): Promise<string> {
+        const path = await findCodexSessionPath(codexSessionId)
+        if (!path) {
+            throw new Error(`Codex session file not found for: ${codexSessionId}`)
+        }
+        return path
+    }
+
     async applySessionConfig(
         sessionId: string,
         config: {
@@ -637,6 +863,14 @@ export class SyncEngine {
 
     async listMachineDirectory(machineId: string, path: string): Promise<RpcListDirectoryResponse> {
         return await this.rpcGateway.listMachineDirectory(machineId, path)
+    }
+
+    async listClaudeSessions(machineId: string, workingDirectory: string): Promise<{ success: boolean; sessions?: Array<{ sessionId: string; lastModified: number; size: number; cwd: string }>; error?: string }> {
+        return await this.rpcGateway.listClaudeSessions(machineId, workingDirectory)
+    }
+
+    async listCodexSessions(machineId: string, workingDirectory: string): Promise<{ success: boolean; sessions?: Array<{ sessionId: string; lastModified: number; size: number; cwd: string }>; error?: string }> {
+        return await this.rpcGateway.listCodexSessions(machineId, workingDirectory)
     }
 
     async getGitStatus(sessionId: string, cwd?: string): Promise<RpcCommandResponse> {

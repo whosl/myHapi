@@ -4,6 +4,9 @@
   "workspaces": {
     "": {
       "name": "hapi",
+      "dependencies": {
+        "mermaid": "^11.14.0",
+      },
       "devDependencies": {
         "concurrently": "^9.2.1",
         "playwright": "1.49.1",

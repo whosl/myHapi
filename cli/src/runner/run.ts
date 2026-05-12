@@ -1,5 +1,6 @@
 import fs from 'fs/promises';
 import os from 'os';
+import { join } from 'node:path';
 
 import { ApiClient } from '@/api/api';
 import { TrackedSession } from './types';
@@ -8,6 +9,7 @@ import { SpawnSessionOptions, SpawnSessionResult } from '@/modules/common/rpcTyp
 import { logger } from '@/ui/logger';
 import { authAndSetupMachineIfNeeded } from '@/ui/auth';
 import { configuration } from '@/configuration';
+import { findCodexSessionCwd } from '@/api/codexSessionCache';
 import packageJson from '../../package.json';
 import { getEnvironmentInfo } from '@/ui/doctor';
 import { spawnHappyCLI } from '@/utils/spawnHappyCLI';
@@ -20,7 +22,6 @@ import { isRetryableConnectionError } from '@/utils/errorUtils';
 import { cleanupRunnerState, getInstalledCliMtimeMs, isRunnerRunningCurrentlyInstalledHappyVersion, stopRunner } from './controlClient';
 import { startRunnerControlServer } from './controlServer';
 import { createWorktree, removeWorktree, type WorktreeInfo } from './worktree';
-import { join } from 'path';
 import { buildMachineMetadata } from '@/agent/sessionFactory';
 import { resolveWorkspaceRoots } from '@/utils/workspaceRoot';
 import { hashRunnerCliApiToken } from './runnerIdentity';
@@ -240,6 +241,19 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
       const worktreeName = options.worktreeName;
       let directoryCreated = false;
       let spawnDirectory = directory;
+
+      // When resuming a Codex session, resolve the original cwd from the cached index
+      if (options.resumeSessionId && agent === 'codex') {
+        try {
+          const resolvedCwd = await findCodexSessionCwd(options.resumeSessionId);
+          if (resolvedCwd) {
+            logger.debug(`[RUNNER RUN] Resumed Codex session cwd: ${resolvedCwd} (overriding directory: ${directory})`);
+            spawnDirectory = resolvedCwd;
+          }
+        } catch (err) {
+          logger.debug(`[RUNNER RUN] Failed to resolve Codex session cwd for resume, using provided directory`, err);
+        }
+      }
       let worktreeInfo: WorktreeInfo | null = null;
       let happyProcess: ReturnType<typeof spawnHappyCLI> | null = null;
 
@@ -356,6 +370,29 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
             // Write the token to the temporary directory
             await fs.writeFile(join(codexHomeDir, 'auth.json'), options.token);
 
+            // Copy essential config from user's real CODEX_HOME so sandbox and
+            // model settings are preserved (especially Windows elevated sandbox).
+            try {
+              const userCodexHome = process.env.CODEX_HOME || join(os.homedir(), '.codex');
+              const filesToCopy = ['config.toml', 'cap_sid'];
+              for (const file of filesToCopy) {
+                const src = join(userCodexHome, file);
+                try {
+                  await fs.copyFile(src, join(codexHomeDir, file));
+                } catch { /* not all files exist */ }
+              }
+              // Copy sandbox binaries directory if present
+              const sandboxBinSrc = join(userCodexHome, '.sandbox-bin');
+              const sandboxBinDest = join(codexHomeDir, '.sandbox-bin');
+              try {
+                await fs.mkdir(sandboxBinDest, { recursive: true });
+                const entries = await fs.readdir(sandboxBinSrc);
+                for (const entry of entries) {
+                  await fs.copyFile(join(sandboxBinSrc, entry), join(sandboxBinDest, entry));
+                }
+              } catch { /* sandbox-bin not available */ }
+            } catch { /* user codex home not accessible */ }
+
             // Set the environment variable for Codex
             extraEnv = {
               CODEX_HOME: codexHomeDir
@@ -376,6 +413,26 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
             HAPI_WORKTREE_PATH: worktreeInfo.worktreePath,
             HAPI_WORKTREE_CREATED_AT: String(worktreeInfo.createdAt)
           };
+        }
+
+        // Check for model router proxy config
+        if (agent === 'claude' || !agent) {
+          try {
+            const configDir = process.env.CLAUDE_CONFIG_DIR || join(os.homedir(), '.claude');
+            const configPath = join(configDir, 'model-routes.json');
+            const configRaw = await fs.readFile(configPath, 'utf-8');
+            const config = JSON.parse(configRaw);
+            if (config.routes && config.routes.length > 0) {
+              const port = config.port ?? 3099;
+              extraEnv = {
+                ...extraEnv,
+                ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}`,
+                ANTHROPIC_AUTH_TOKEN: 'hapi-proxy',
+              };
+            }
+          } catch {
+            // No model-routes.json — normal behavior, skip
+          }
         }
 
         const args = buildCliArgs(agent, options, yolo);
@@ -925,7 +982,7 @@ export function buildCliArgs(
     }
   }
   args.push('--hapi-starting-mode', 'remote', '--started-by', 'runner');
-  if (options.model) {
+  if (options.model && agent !== 'opencode') {
     args.push('--model', options.model);
   }
   if (options.effort && agent === 'claude') {
@@ -936,8 +993,10 @@ export function buildCliArgs(
   }
   if (options.permissionMode && (PERMISSION_MODES as readonly string[]).includes(options.permissionMode)) {
     args.push('--permission-mode', options.permissionMode);
-  } else if (yolo) {
+  } else if (yolo && process.getuid?.() !== 0) {
     args.push('--yolo');
+  } else if (yolo && process.getuid?.() === 0) {
+    args.push('--permission-mode', 'dontAsk');
   }
   return args;
 }

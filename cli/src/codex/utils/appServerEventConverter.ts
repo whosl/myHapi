@@ -860,7 +860,39 @@ export class AppServerEventConverter {
             }
         }
 
+        const newEvents = this.handleNewNotifications(method, paramsRecord, scoped);
+        if (newEvents.length > 0) {
+            return newEvents;
+        }
+
         logger.debug('[AppServerEventConverter] Unhandled notification', { method, params });
+        return events;
+    }
+
+    private handleNewNotifications(method: string, paramsRecord: Record<string, unknown>, scoped: (e: ConvertedEvent) => ConvertedEvent): ConvertedEvent[] {
+        const events: ConvertedEvent[] = [];
+
+        if (method === 'serverRequest/expired' || method === 'serverRequest/autoResolved') {
+            const requestId = asString(paramsRecord.requestId ?? paramsRecord.id);
+            if (requestId) {
+                events.push(scoped({ type: 'permission_expired', request_id: requestId }));
+            }
+            return events;
+        }
+
+        if (method === 'windowsSandbox/setupComplete') {
+            const sandboxId = asString(paramsRecord.sandboxId);
+            const success = asBoolean(paramsRecord.success) ?? false;
+            events.push(scoped({ type: 'sandbox_setup_complete', sandbox_id: sandboxId, success }));
+            return events;
+        }
+
+        if (method === 'windowsSandbox/setupError') {
+            const error = asString(paramsRecord.error ?? paramsRecord.message);
+            events.push(scoped({ type: 'sandbox_setup_error', error: error ?? 'Unknown sandbox error' }));
+            return events;
+        }
+
         return events;
     }
 

@@ -24,4 +24,43 @@ describe('parseCodexSpecialCommand', () => {
         expect(parseCodexSpecialCommand('/clearing')).toEqual({ type: null });
         expect(parseCodexSpecialCommand('please /clear')).toEqual({ type: null });
     });
+
+    it('parses /fork command', () => {
+        expect(parseCodexSpecialCommand('/fork')).toEqual({ type: 'fork' });
+    });
+
+    it('rejects /fork with arguments', () => {
+        expect(parseCodexSpecialCommand('/fork hello')).toEqual({
+            type: 'invalid',
+            command: 'fork',
+            message: '/fork does not accept arguments'
+        });
+    });
+
+    it('parses /rollback without argument as 1 turn', () => {
+        expect(parseCodexSpecialCommand('/rollback')).toEqual({ type: 'rollback', numTurns: 1 });
+    });
+
+    it('parses /rollback with a number', () => {
+        expect(parseCodexSpecialCommand('/rollback 3')).toEqual({ type: 'rollback', numTurns: 3 });
+        expect(parseCodexSpecialCommand('/rollback 10')).toEqual({ type: 'rollback', numTurns: 10 });
+    });
+
+    it('rejects /rollback with invalid arguments', () => {
+        expect(parseCodexSpecialCommand('/rollback abc')).toEqual({
+            type: 'invalid',
+            command: 'rollback',
+            message: '/rollback requires a positive number (e.g. /rollback 2)'
+        });
+        expect(parseCodexSpecialCommand('/rollback -1')).toEqual({
+            type: 'invalid',
+            command: 'rollback',
+            message: '/rollback requires a positive number (e.g. /rollback 2)'
+        });
+        expect(parseCodexSpecialCommand('/rollback 0')).toEqual({
+            type: 'invalid',
+            command: 'rollback',
+            message: '/rollback requires a positive number (e.g. /rollback 2)'
+        });
+    });
 });

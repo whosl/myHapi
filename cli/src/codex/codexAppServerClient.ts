@@ -1,4 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { logger } from '@/ui/logger';
 import { killProcessByChildProcess } from '@/utils/process';
 import type {
@@ -15,7 +17,24 @@ import type {
     TurnInterruptParams,
     TurnInterruptResponse,
     ThreadCompactStartParams,
-    ThreadCompactStartResponse
+    ThreadCompactStartResponse,
+    ServerCapabilities,
+    ThreadListParams,
+    ThreadListResponse,
+    ThreadForkParams,
+    ThreadForkResponse,
+    ThreadRollbackParams,
+    ThreadRollbackResponse,
+    TurnSteerParams,
+    TurnSteerResponse,
+    CommandExecParams,
+    CommandExecResponse,
+    ServerRequestResolvedParams,
+    ServerRequestResolvedResponse,
+    AvailableDecisionsParams,
+    AvailableDecisionsResponse,
+    WindowsSandboxSetupStartParams,
+    WindowsSandboxSetupStartResponse
 } from './appServerTypes';
 
 type JsonRpcLiteRequest = {
@@ -60,6 +79,49 @@ function createAbortError(): Error {
     return error;
 }
 
+function resolveCodexBinary(): string {
+    if (process.platform !== 'win32') {
+        return 'codex';
+    }
+
+    // On Windows, skip the codex.cmd → node codex.js → codex.exe chain.
+    // codex.js uses stdio:'inherit' which breaks pipe-based IPC.
+    // Resolve the native codex.exe directly.
+    const codexHome = process.env.CODEX_HOME;
+    const searchRoots: string[] = [];
+    if (codexHome) {
+        searchRoots.push(codexHome);
+    }
+    const npmGlobal = process.env.APPDATA
+        ? join(process.env.APPDATA, 'npm', 'node_modules', '@openai', 'codex')
+        : null;
+    if (npmGlobal) {
+        searchRoots.push(npmGlobal);
+    }
+
+    for (const root of searchRoots) {
+        const exePath = join(
+            root,
+            'node_modules', '@openai', 'codex-win32-x64',
+            'vendor', 'x86_64-pc-windows-msvc', 'codex', 'codex.exe'
+        );
+        if (existsSync(exePath)) {
+            return exePath;
+        }
+        // Fallback: local vendor inside the codex package
+        const localExe = join(
+            root,
+            'vendor', 'x86_64-pc-windows-msvc', 'codex', 'codex.exe'
+        );
+        if (existsSync(localExe)) {
+            return localExe;
+        }
+    }
+
+    // Fall back to codex.cmd (will use shell: true)
+    return 'codex';
+}
+
 export class CodexAppServerClient {
     private process: ChildProcessWithoutNullStreams | null = null;
     private connected = false;
@@ -69,6 +131,8 @@ export class CodexAppServerClient {
     private readonly requestHandlers = new Map<string, RequestHandler>();
     private notificationHandler: ((method: string, params: unknown) => void) | null = null;
     private protocolError: Error | null = null;
+    private keepAliveTimer: ReturnType<typeof setInterval> | null = null;
+    private readonly unsupportedMethods = new Set<string>();
 
     static readonly DEFAULT_TIMEOUT_MS = 14 * 24 * 60 * 60 * 1000;
 
@@ -77,7 +141,10 @@ export class CodexAppServerClient {
             return;
         }
 
-        this.process = spawn('codex', ['app-server'], {
+        const command = resolveCodexBinary();
+        const useShell = !command.endsWith('.exe');
+
+        this.process = spawn(command, ['app-server'], {
             env: Object.keys(process.env).reduce((acc, key) => {
                 const value = process.env[key];
                 if (typeof value === 'string') acc[key] = value;
@@ -100,6 +167,10 @@ export class CodexAppServerClient {
         });
 
         this.process.on('exit', (code, signal) => {
+            if (this.keepAliveTimer) {
+                clearInterval(this.keepAliveTimer);
+                this.keepAliveTimer = null;
+            }
             const message = `Codex app-server exited (code=${code ?? 'null'}, signal=${signal ?? 'null'})`;
             logger.debug(message);
             this.rejectAllPending(new Error(message));
@@ -109,6 +180,10 @@ export class CodexAppServerClient {
         });
 
         this.process.on('error', (error) => {
+            if (this.keepAliveTimer) {
+                clearInterval(this.keepAliveTimer);
+                this.keepAliveTimer = null;
+            }
             logger.debug('[CodexAppServer] Process error', error);
             const message = error instanceof Error ? error.message : String(error);
             this.rejectAllPending(new Error(
@@ -121,6 +196,15 @@ export class CodexAppServerClient {
         });
 
         this.connected = true;
+
+        // Keep stdin active so the codex binary doesn't exit after turn/start
+        this.keepAliveTimer = setInterval(() => {
+            if (this.process?.stdin?.writable) {
+                this.process.stdin.write('\n');
+            }
+        }, 5000);
+        this.keepAliveTimer.unref();
+
         logger.debug('[CodexAppServer] Connected');
     }
 
@@ -132,9 +216,19 @@ export class CodexAppServerClient {
         this.requestHandlers.set(method, handler);
     }
 
+    hasCapability(method: string): boolean {
+        return !this.unsupportedMethods.has(method);
+    }
+
     async initialize(params: InitializeParams): Promise<InitializeResponse> {
         const response = await this.sendRequest('initialize', params, { timeoutMs: 30_000 });
-        this.sendNotification('initialized');
+        // codex >= 0.129.0 no longer accepts 'initialized' notification
+        // Keep sending it for backward compatibility — older versions may need it
+        try {
+            this.sendNotification('initialized');
+        } catch {
+            // Ignore — notification send failures are non-critical
+        }
         return response as InitializeResponse;
     }
 
@@ -187,9 +281,108 @@ export class CodexAppServerClient {
         return response as ThreadCompactStartResponse;
     }
 
+    // --- New API methods ---
+
+    async listThreads(params?: ThreadListParams, options?: { signal?: AbortSignal }): Promise<ThreadListResponse> {
+        if (!this.hasCapability('thread/list')) {
+            return { data: [] };
+        }
+        const response = await this.sendRequest('thread/list', params ?? {}, {
+            signal: options?.signal,
+            timeoutMs: 30_000
+        });
+        return response as ThreadListResponse;
+    }
+
+    async forkThread(params: ThreadForkParams, options?: { signal?: AbortSignal }): Promise<ThreadForkResponse> {
+        if (!this.hasCapability('thread/fork')) {
+            throw new Error("Codex app-server does not support 'thread/fork'");
+        }
+        const response = await this.sendRequest('thread/fork', params, {
+            signal: options?.signal,
+            timeoutMs: CodexAppServerClient.DEFAULT_TIMEOUT_MS
+        });
+        return response as ThreadForkResponse;
+    }
+
+    async rollbackThread(params: ThreadRollbackParams, options?: { signal?: AbortSignal }): Promise<ThreadRollbackResponse> {
+        if (!this.hasCapability('thread/rollback')) {
+            throw new Error("Codex app-server does not support 'thread/rollback'");
+        }
+        const response = await this.sendRequest('thread/rollback', params, {
+            signal: options?.signal,
+            timeoutMs: 60_000
+        });
+        return response as ThreadRollbackResponse;
+    }
+
+    async steerTurn(params: TurnSteerParams): Promise<TurnSteerResponse> {
+        if (!this.hasCapability('turn/steer')) {
+            throw new Error("Codex app-server does not support 'turn/steer'");
+        }
+        const response = await this.sendRequest('turn/steer', params, {
+            timeoutMs: 30_000
+        });
+        return response as TurnSteerResponse;
+    }
+
+    async execCommand(params: CommandExecParams, options?: { signal?: AbortSignal }): Promise<CommandExecResponse> {
+        if (!this.hasCapability('command/exec')) {
+            throw new Error("Codex app-server does not support 'command/exec'");
+        }
+        // On Windows, command/exec defaults to sandbox which may fail with
+        // CreateProcessAsUserW. Inject dangerFullAccess sandboxPolicy when
+        // no sandbox policy is explicitly provided.
+        const finalParams = { ...params };
+        if (process.platform === 'win32' && !finalParams.sandboxPolicy) {
+            finalParams.sandboxPolicy = { type: 'dangerFullAccess' };
+        }
+        const response = await this.sendRequest('command/exec', finalParams, {
+            signal: options?.signal,
+            timeoutMs: params.timeoutMs ?? 120_000
+        });
+        return response as CommandExecResponse;
+    }
+
+    async resolveServerRequest(params: ServerRequestResolvedParams): Promise<ServerRequestResolvedResponse> {
+        if (!this.hasCapability('serverRequest/resolved')) {
+            throw new Error("Codex app-server does not support 'serverRequest/resolved'");
+        }
+        const response = await this.sendRequest('serverRequest/resolved', params, {
+            timeoutMs: 30_000
+        });
+        return response as ServerRequestResolvedResponse;
+    }
+
+    async getAvailableDecisions(params: AvailableDecisionsParams): Promise<AvailableDecisionsResponse> {
+        if (!this.hasCapability('serverRequest/resolved')) {
+            return { decisions: ['accept', 'acceptForSession', 'decline', 'cancel'] };
+        }
+        const response = await this.sendRequest('availableDecisions', params, {
+            timeoutMs: 10_000
+        });
+        return response as AvailableDecisionsResponse;
+    }
+
+    async startWindowsSandboxSetup(params: WindowsSandboxSetupStartParams, options?: { signal?: AbortSignal }): Promise<WindowsSandboxSetupStartResponse> {
+        if (!this.hasCapability('windowsSandbox/setupStart')) {
+            throw new Error("Codex app-server does not support 'windowsSandbox/setupStart'");
+        }
+        const response = await this.sendRequest('windowsSandbox/setupStart', params, {
+            signal: options?.signal,
+            timeoutMs: 60_000
+        });
+        return response as WindowsSandboxSetupStartResponse;
+    }
+
     async disconnect(): Promise<void> {
         if (!this.connected) {
             return;
+        }
+
+        if (this.keepAliveTimer) {
+            clearInterval(this.keepAliveTimer);
+            this.keepAliveTimer = null;
         }
 
         const child = this.process;
@@ -221,6 +414,7 @@ export class CodexAppServerClient {
         }
 
         const id = this.nextId++;
+        this.pendingMethodByRequestId.set(id, method);
         const payload: JsonRpcLiteRequest = {
             id,
             method,
@@ -385,6 +579,8 @@ export class CodexAppServerClient {
         }
     }
 
+    private pendingMethodByRequestId = new Map<number, string>();
+
     private handleResponse(response: JsonRpcLiteResponse): void {
         if (response.id === null || response.id === undefined) {
             logger.debug('[CodexAppServer] Received response without id');
@@ -403,8 +599,16 @@ export class CodexAppServerClient {
         }
 
         this.pending.delete(response.id);
+        this.pendingMethodByRequestId.delete(response.id);
 
         if (response.error) {
+            if (response.error.code === -32601) {
+                const method = response.error.message.match(/Method not found: (.+)/)?.[1];
+                if (method) {
+                    this.unsupportedMethods.add(method);
+                    logger.debug(`[CodexAppServer] Method '${method}' not supported, caching as unavailable`);
+                }
+            }
             pending.reject(new Error(response.error.message));
             return;
         }

@@ -238,6 +238,16 @@ export class MessageQueue2<T> {
     }
 
     /**
+     * Drain all queued messages and return them.
+     * Used by turn/steer to consume queued messages during an active turn.
+     */
+    drain(): QueueItem<T>[] {
+        const items = this.queue.splice(0);
+        logger.debug(`[MessageQueue2] drain() removed ${items.length} messages`);
+        return items;
+    }
+
+    /**
      * Wait for messages and return all messages with the same mode as a single string
      * Returns { message: string, mode: T } or null if aborted/closed
      */

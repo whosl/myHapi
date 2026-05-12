@@ -1,6 +1,8 @@
 export type CodexSpecialCommand =
     | { type: 'clear' | 'compact' }
-    | { type: 'invalid'; command: 'clear' | 'compact'; message: string }
+    | { type: 'fork' }
+    | { type: 'rollback'; numTurns?: number }
+    | { type: 'invalid'; command: string; message: string }
     | { type: null };
 
 export function parseCodexSpecialCommand(message: string): CodexSpecialCommand {
@@ -24,6 +26,31 @@ export function parseCodexSpecialCommand(message: string): CodexSpecialCommand {
             command: 'compact',
             message: '/compact does not accept arguments'
         };
+    }
+    if (trimmed === '/fork') {
+        return { type: 'fork' };
+    }
+    if (trimmed.startsWith('/fork ')) {
+        return {
+            type: 'invalid',
+            command: 'fork',
+            message: '/fork does not accept arguments'
+        };
+    }
+    if (trimmed === '/rollback') {
+        return { type: 'rollback', numTurns: 1 };
+    }
+    if (trimmed.startsWith('/rollback ')) {
+        const arg = trimmed.slice(10).trim();
+        const numTurns = parseInt(arg, 10);
+        if (isNaN(numTurns) || numTurns < 1) {
+            return {
+                type: 'invalid',
+                command: 'rollback',
+                message: '/rollback requires a positive number (e.g. /rollback 2)'
+            };
+        }
+        return { type: 'rollback', numTurns };
     }
     return { type: null };
 }

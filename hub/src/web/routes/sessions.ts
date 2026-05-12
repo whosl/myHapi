@@ -34,6 +34,15 @@ const renameSessionSchema = z.object({
     name: z.string().min(1).max(255)
 })
 
+const importHistorySchema = z.object({
+    claudeSessionId: z.string().min(1).optional(),
+    codexSessionId: z.string().min(1).optional(),
+    workingDirectory: z.string().min(1)
+}).refine(
+    (data) => data.claudeSessionId || data.codexSessionId,
+    { message: 'Either claudeSessionId or codexSessionId is required' }
+)
+
 const uploadSchema = z.object({
     filename: z.string().min(1).max(255),
     content: z.string().min(1),
@@ -485,6 +494,46 @@ export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Ho
                 return c.json({ error: message }, 409)
             }
             return c.json({ error: message }, 500)
+        }
+    })
+
+    app.post('/sessions/:id/import-history', async (c) => {
+        const engine = requireSyncEngine(c, getSyncEngine)
+        if (engine instanceof Response) {
+            return engine
+        }
+
+        const sessionResult = requireSessionFromParam(c, engine)
+        if (sessionResult instanceof Response) {
+            return sessionResult
+        }
+
+        const body = await c.req.json().catch(() => null)
+        const parsed = importHistorySchema.safeParse(body)
+        if (!parsed.success) {
+            return c.json({ error: 'Invalid body: claudeSessionId or codexSessionId and workingDirectory are required' }, 400)
+        }
+
+        try {
+            let result: { imported: number }
+            if (parsed.data.codexSessionId) {
+                result = await engine.importCodexHistory(
+                    sessionResult.sessionId,
+                    parsed.data.codexSessionId,
+                    parsed.data.workingDirectory
+                )
+            } else {
+                result = await engine.importClaudeHistory(
+                    sessionResult.sessionId,
+                    parsed.data.claudeSessionId!,
+                    parsed.data.workingDirectory
+                )
+            }
+            return c.json({ ok: true, imported: result.imported })
+        } catch (error) {
+            return c.json({
+                error: error instanceof Error ? error.message : 'Failed to import history'
+            }, 500)
         }
     })
 

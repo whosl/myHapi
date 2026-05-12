@@ -12,7 +12,8 @@ const spawnBodySchema = z.object({
     modelReasoningEffort: z.string().optional(),
     yolo: z.boolean().optional(),
     sessionType: z.enum(['simple', 'worktree']).optional(),
-    worktreeName: z.string().optional()
+    worktreeName: z.string().optional(),
+    resumeSessionId: z.string().optional()
 })
 
 const pathsExistsSchema = z.object({
@@ -60,7 +61,7 @@ export function createMachinesRoutes(getSyncEngine: () => SyncEngine | null): Ho
             parsed.data.yolo,
             parsed.data.sessionType,
             parsed.data.worktreeName,
-            undefined,
+            parsed.data.resumeSessionId || undefined,
             parsed.data.effort
         )
         return c.json(result)
@@ -120,6 +121,62 @@ export function createMachinesRoutes(getSyncEngine: () => SyncEngine | null): Ho
             return c.json({ exists })
         } catch (error) {
             return c.json({ error: error instanceof Error ? error.message : 'Failed to check paths' }, 500)
+        }
+    })
+
+    app.get('/machines/:id/claude-sessions', async (c) => {
+        const engine = getSyncEngine()
+        if (!engine) {
+            return c.json({ success: false, error: 'Not connected' }, 503)
+        }
+
+        const machineId = c.req.param('id')
+        const machine = requireMachine(c, engine, machineId)
+        if (machine instanceof Response) {
+            return machine
+        }
+
+        const workingDirectory = c.req.query('workingDirectory')
+        if (!workingDirectory) {
+            return c.json({ success: false, error: 'workingDirectory query param is required' }, 400)
+        }
+
+        try {
+            const result = await engine.listClaudeSessions(machineId, workingDirectory)
+            return c.json(result)
+        } catch (error) {
+            return c.json({
+                success: false,
+                error: error instanceof Error ? error.message : 'Failed to list sessions'
+            }, 500)
+        }
+    })
+
+    app.get('/machines/:id/codex-sessions', async (c) => {
+        const engine = getSyncEngine()
+        if (!engine) {
+            return c.json({ success: false, error: 'Not connected' }, 503)
+        }
+
+        const machineId = c.req.param('id')
+        const machine = requireMachine(c, engine, machineId)
+        if (machine instanceof Response) {
+            return machine
+        }
+
+        const workingDirectory = c.req.query('workingDirectory')
+        if (!workingDirectory) {
+            return c.json({ success: false, error: 'workingDirectory query param is required' }, 400)
+        }
+
+        try {
+            const result = await engine.listCodexSessions(machineId, workingDirectory)
+            return c.json(result)
+        } catch (error) {
+            return c.json({
+                success: false,
+                error: error instanceof Error ? error.message : 'Failed to list Codex sessions'
+            }, 500)
         }
     })
 

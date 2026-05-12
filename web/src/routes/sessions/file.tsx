@@ -249,6 +249,19 @@ export default function FilePage() {
                 </div>
             ) : null}
 
+            {/\.(vcd|fst|ghw)$/i.test(filePath) ? (
+                <div className="bg-[var(--app-bg)]">
+                    <div className="mx-auto w-full max-w-content px-3 py-2 flex items-center gap-2 border-b border-[var(--app-divider)] bg-blue-600/10">
+                        <span className="min-w-0 flex-1 truncate text-xs text-[var(--app-hint)]">Waveform file detected</span>
+                        <a href={`https://bibao.nas.cpolar.cn/files/${encodeURIComponent(filePath.replace(/^\/home\/bibao\//, ''))}`}
+                           download
+                           className="shrink-0 rounded px-3 py-1.5 bg-blue-600 text-white text-xs font-semibold hover:bg-blue-500 transition-colors">
+                            Download VCD
+                        </a>
+                    </div>
+                </div>
+            ) : null}
+
             <div className="app-scroll-y flex-1 min-h-0">
                 <div className="mx-auto w-full max-w-content p-4">
                     {diffErrorMessage ? (

@@ -5,6 +5,17 @@ export interface InitializeCapabilities {
     experimentalApi: boolean;
 }
 
+export interface ServerCapabilities {
+    experimentalApi?: boolean;
+    threadList?: boolean;
+    threadFork?: boolean;
+    threadRollback?: boolean;
+    turnSteer?: boolean;
+    commandExec?: boolean;
+    explicitApproval?: boolean;
+    windowsSandboxSetup?: boolean;
+}
+
 export interface InitializeParams {
     clientInfo: {
         name: string;
@@ -16,6 +27,9 @@ export interface InitializeParams {
 
 export interface InitializeResponse {
     userAgent?: string;
+    codexHome?: string;
+    platformFamily?: string;
+    platformOs?: string;
     [key: string]: unknown;
 }
 
@@ -176,4 +190,135 @@ export interface ThreadCompactStartParams {
 
 export interface ThreadCompactStartResponse {
     [key: string]: unknown;
+}
+
+// --- New API types ---
+
+export interface ThreadListParams {
+    cwd?: string | string[] | null;
+    limit?: number | null;
+    cursor?: string | null;
+    archived?: boolean | null;
+    [key: string]: unknown;
+}
+
+export interface ThreadListItem {
+    id: string;
+    sessionId?: string;
+    preview?: string;
+    cwd?: string;
+    modelProvider?: string;
+    createdAt?: number;
+    updatedAt?: number;
+    status?: string;
+    path?: string;
+    cliVersion?: string;
+    source?: string;
+    name?: string | null;
+    [key: string]: unknown;
+}
+
+export interface ThreadListResponse {
+    data: ThreadListItem[];
+    nextCursor?: string | null;
+    [key: string]: unknown;
+}
+
+export interface ThreadForkParams {
+    threadId: string;
+    model?: string | null;
+    cwd?: string | null;
+    approvalPolicy?: ApprovalPolicy | null;
+    sandbox?: SandboxMode | null;
+    config?: Record<string, unknown> | null;
+    baseInstructions?: string | null;
+    developerInstructions?: string | null;
+    ephemeral?: boolean;
+    [key: string]: unknown;
+}
+
+export interface ThreadForkResponse {
+    thread: {
+        id: string;
+        forkedFromId?: string | null;
+        [key: string]: unknown;
+    };
+    model: string;
+    modelProvider: string;
+    cwd: string;
+    [key: string]: unknown;
+}
+
+export interface ThreadRollbackParams {
+    threadId: string;
+    numTurns: number;
+}
+
+export interface ThreadRollbackResponse {
+    thread: {
+        id: string;
+        [key: string]: unknown;
+    };
+    [key: string]: unknown;
+}
+
+export interface TurnSteerParams {
+    threadId: string;
+    input: UserInput[];
+    expectedTurnId: string;
+}
+
+export interface TurnSteerResponse {
+    turnId: string;
+}
+
+export interface CommandExecParams {
+    command: string[];
+    cwd?: string | null;
+    processId?: string | null;
+    tty?: boolean;
+    streamStdin?: boolean;
+    streamStdoutStderr?: boolean;
+    timeoutMs?: number | null;
+    disableTimeout?: boolean;
+    env?: Record<string, string | null> | null;
+    [key: string]: unknown;
+}
+
+export interface CommandExecResponse {
+    exitCode: number;
+    stdout: string;
+    stderr: string;
+}
+
+export type ServerRequestResolvedDecision = 'accept' | 'acceptForSession' | 'decline' | 'cancel';
+
+export interface ServerRequestResolvedParams {
+    requestId: string;
+    decision: ServerRequestResolvedDecision;
+    reason?: string;
+}
+
+export interface ServerRequestResolvedResponse {
+    [key: string]: unknown;
+}
+
+export interface AvailableDecisionsParams {
+    requestId: string;
+}
+
+export interface AvailableDecisionsResponse {
+    decisions: ServerRequestResolvedDecision[];
+    [key: string]: unknown;
+}
+
+export type WindowsSandboxSetupMode = 'elevated' | 'unelevated';
+
+export interface WindowsSandboxSetupStartParams {
+    mode: WindowsSandboxSetupMode;
+    cwd?: string | null;
+}
+
+export interface WindowsSandboxSetupStartResponse {
+    started: boolean;
 }

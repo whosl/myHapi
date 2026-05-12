@@ -7,6 +7,7 @@ import { readdir, realpath, stat } from 'node:fs/promises'
 import { realpathSync } from 'node:fs'
 import { basename, dirname, isAbsolute, join, relative, resolve as resolvePath } from 'node:path'
 import { logger } from '@/ui/logger'
+import { listCodexSessions as listCachedCodexSessions } from './codexSessionCache'
 import { configuration } from '@/configuration'
 import type { Update, UpdateMachineBody } from '@hapi/protocol'
 import type { RunnerState, Machine, MachineMetadata } from './types'
@@ -256,6 +257,63 @@ export class ApiMachineClient {
                 return await listOpencodeModelsForCwd(resolvedCwd)
             }
         )
+
+        this.rpcHandlerManager.registerHandler<{ workingDirectory: string }, { success: boolean; sessions?: Array<{ sessionId: string; lastModified: number; size: number; cwd: string }>; error?: string }>('list-claude-sessions', async (params) => {
+            const workingDir = typeof params?.workingDirectory === 'string' ? params.workingDirectory.trim() : ''
+            if (!workingDir) {
+                return { success: false, error: 'workingDirectory is required' }
+            }
+
+            try {
+                const { homedir } = await import('node:os')
+                const projectId = resolvePath(workingDir).replace(/[^a-zA-Z0-9]/g, '-')
+                const claudeConfigDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')
+                const projectDir = join(claudeConfigDir, 'projects', projectId)
+
+                let fileNames: string[]
+                try {
+                    fileNames = await readdir(projectDir)
+                } catch {
+                    return { success: true, sessions: [] }
+                }
+
+                const sessions: Array<{ sessionId: string; lastModified: number; size: number; cwd: string }> = []
+                for (const name of fileNames) {
+                    if (!name.endsWith('.jsonl')) continue
+                    const filePath = join(projectDir, name)
+                    try {
+                        const stats = await stat(filePath)
+                        sessions.push({
+                            sessionId: name.slice(0, -'.jsonl'.length),
+                            lastModified: stats.mtime.getTime(),
+                            size: stats.size,
+                            cwd: resolvePath(workingDir)
+                        })
+                    } catch {
+                        // skip unreadable files
+                    }
+                }
+
+                sessions.sort((a, b) => b.lastModified - a.lastModified)
+                return { success: true, sessions }
+            } catch (error) {
+                return { success: false, error: error instanceof Error ? error.message : 'Failed to list Claude sessions' }
+            }
+        })
+
+        this.rpcHandlerManager.registerHandler<{ workingDirectory: string }, { success: boolean; sessions?: Array<{ sessionId: string; lastModified: number; size: number; cwd?: string }>; error?: string }>('list-codex-sessions', async (params) => {
+            const workingDir = typeof params?.workingDirectory === 'string' ? params.workingDirectory.trim() : ''
+            if (!workingDir) {
+                return { success: false, error: 'workingDirectory is required' }
+            }
+
+            try {
+                const sessions = await listCachedCodexSessions(workingDir)
+                return { success: true, sessions }
+            } catch (error) {
+                return { success: false, error: error instanceof Error ? error.message : 'Failed to list Codex sessions' }
+            }
+        })
     }
 
     private isWithinWorkspaceRoots(absolutePath: string): boolean {

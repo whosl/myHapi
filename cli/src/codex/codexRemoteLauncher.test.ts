@@ -507,6 +507,24 @@ vi.mock('./codexAppServerClient', () => {
         }
 
         async disconnect(): Promise<void> {}
+
+        hasCapability(): boolean { return false; }
+
+        async resolveServerRequest(): Promise<{ ok: boolean }> { return { ok: true }; }
+
+        async getAvailableDecisions(): Promise<{ decisions: string[] }> { return { decisions: ['accept', 'acceptForSession', 'decline', 'cancel'] }; }
+
+        async listThreads(): Promise<{ data: null }> { return { data: null }; }
+
+        async forkThread(): Promise<{ thread: { id: string } }> { return { thread: { id: 'thread-forked' } }; }
+
+        async rollbackThread(): Promise<{ thread: { id: string } }> { return { thread: { id: this.currentThreadId } }; }
+
+        async steerTurn(): Promise<{ ok: boolean }> { return { ok: true }; }
+
+        async execCommand(): Promise<{ output: string; exitCode: number }> { return { output: '', exitCode: 0 }; }
+
+        async startWindowsSandboxSetup(): Promise<{ ok: boolean }> { return { ok: true }; }
     }
 
     return { CodexAppServerClient: MockCodexAppServerClient };
