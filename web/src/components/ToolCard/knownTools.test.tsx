@@ -58,6 +58,20 @@ describe('getToolPresentation — unknown tool semantic title + subtitle dedup',
         expect(presentation.subtitle).toBe('ls -la /tmp')
     })
 
+    it('uses input.name as a fallback subtitle for unknown tool cards', () => {
+        const presentation = getToolPresentation({
+            toolName: 'Tool',
+            input: { name: 'Tool 1' },
+            result: null,
+            childrenCount: 0,
+            description: null,
+            metadata: null,
+        })
+
+        expect(presentation.title).toBe('Tool')
+        expect(presentation.subtitle).toBe('Tool 1')
+    })
+
     it('returns null subtitle when no recognized input field is present', () => {
         const presentation = getToolPresentation({
             toolName: 'mystery_tool',

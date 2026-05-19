@@ -1,4 +1,4 @@
-import type { AgentEvent, NormalizedAgentContent, NormalizedMessage, ToolResultPermission } from '@/chat/types'
+import type { AgentEvent, CodexReview, CodexReviewFinding, NormalizedAgentContent, NormalizedMessage, ToolResultPermission } from '@/chat/types'
 import { AGENT_MESSAGE_PAYLOAD_TYPE, asNumber, asString, isObject } from '@hapi/protocol'
 import { isClaudeChatVisibleMessage } from '@hapi/protocol/messages'
 
@@ -30,6 +30,25 @@ function normalizeToolResultPermissions(value: unknown): ToolResultPermission | 
 function normalizeAgentEvent(value: unknown): AgentEvent | null {
     if (!isObject(value) || typeof value.type !== 'string') return null
     return value as AgentEvent
+}
+
+function normalizeThreadGoal(value: unknown) {
+    if (!isObject(value)) return null
+    const threadId = asString(value.threadId ?? value.thread_id)
+    const objective = asString(value.objective)
+    const status = asString(value.status)
+    if (!threadId || !objective || !status) return null
+    if (status !== 'active' && status !== 'paused' && status !== 'budgetLimited' && status !== 'complete') return null
+    return {
+        threadId,
+        objective,
+        status,
+        tokenBudget: asNumber(value.tokenBudget ?? value.token_budget),
+        tokensUsed: asNumber(value.tokensUsed ?? value.tokens_used) ?? 0,
+        timeUsedSeconds: asNumber(value.timeUsedSeconds ?? value.time_used_seconds) ?? 0,
+        createdAt: asNumber(value.createdAt ?? value.created_at) ?? 0,
+        updatedAt: asNumber(value.updatedAt ?? value.updated_at) ?? 0
+    }
 }
 
 function normalizeCodexTokenUsage(value: unknown, data?: Record<string, unknown>) {
@@ -121,6 +140,75 @@ function normalizePlanEntries(value: unknown): Array<{ step: string; status: 'pe
         })
     }
     return plan
+}
+
+function normalizeCodexReviewFinding(value: unknown): CodexReviewFinding | null {
+    if (!isObject(value)) return null
+    const title = asString(value.title)
+    const body = asString(value.body)
+    if (!title || !body) return null
+
+    const codeLocation = isObject(value.code_location)
+        ? value.code_location
+        : isObject(value.codeLocation)
+            ? value.codeLocation
+            : null
+    const lineRange = codeLocation && isObject(codeLocation.line_range)
+        ? codeLocation.line_range
+        : codeLocation && isObject(codeLocation.lineRange)
+            ? codeLocation.lineRange
+            : null
+
+    return {
+        title,
+        body,
+        priority: asNumber(value.priority),
+        confidenceScore: asNumber(value.confidence_score ?? value.confidenceScore),
+        filePath: codeLocation ? asString(codeLocation.absolute_file_path ?? codeLocation.absoluteFilePath ?? codeLocation.path) : null,
+        lineStart: lineRange ? asNumber(lineRange.start) : null,
+        lineEnd: lineRange ? asNumber(lineRange.end) : null
+    }
+}
+
+function normalizeCodexReviewJson(value: unknown): CodexReview | null {
+    if (!isObject(value)) return null
+    const hasReviewMarker = Array.isArray(value.findings)
+        || 'overall_correctness' in value
+        || 'overallCorrectness' in value
+        || 'overall_explanation' in value
+        || 'overallExplanation' in value
+    if (!hasReviewMarker) return null
+
+    const findings = Array.isArray(value.findings)
+        ? value.findings
+            .map(normalizeCodexReviewFinding)
+            .filter((finding): finding is CodexReviewFinding => finding !== null)
+        : []
+
+    const overallCorrectness = asString(value.overall_correctness ?? value.overallCorrectness)
+    const overallExplanation = asString(value.overall_explanation ?? value.overallExplanation)
+    const overallConfidenceScore = asNumber(value.overall_confidence_score ?? value.overallConfidenceScore)
+
+    if (findings.length === 0 && !overallCorrectness && !overallExplanation && overallConfidenceScore === null) {
+        return null
+    }
+
+    return {
+        findings,
+        overallCorrectness,
+        overallExplanation,
+        overallConfidenceScore
+    }
+}
+
+function parseCodexReviewMessage(message: string): CodexReview | null {
+    const trimmed = message.trim()
+    if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return null
+    try {
+        return normalizeCodexReviewJson(JSON.parse(trimmed) as unknown)
+    } catch {
+        return null
+    }
 }
 
 function normalizeAssistantOutput(
@@ -461,7 +549,41 @@ export function normalizeAgentRecord(
             }
         }
 
+        if (data.type === 'generated-image') {
+            const imageId = asString(data.imageId ?? data.image_id)
+            if (!imageId) return null
+            const uuid = asString(data.id) ?? messageId
+            return {
+                id: messageId,
+                localId,
+                createdAt,
+                role: 'agent',
+                isSidechain: false,
+                content: [{
+                    type: 'generated-image',
+                    imageId,
+                    fileName: asString(data.fileName ?? data.file_name) ?? 'generated-image',
+                    mimeType: asString(data.mimeType ?? data.mime_type),
+                    uuid,
+                    parentUUID: null
+                }],
+                meta
+            }
+        }
+
         if (data.type === 'message' && typeof data.message === 'string') {
+            const review = parseCodexReviewMessage(data.message)
+            if (review) {
+                return {
+                    id: messageId,
+                    localId,
+                    createdAt,
+                    role: 'agent',
+                    isSidechain: false,
+                    content: [{ type: 'codex-review', review, uuid: messageId, parentUUID: null }],
+                    meta
+                }
+            }
             return {
                 id: messageId,
                 localId,
@@ -516,6 +638,40 @@ export function normalizeAgentRecord(
                 meta,
                 usage
             } : null
+        }
+
+        if (data.type === 'thread_goal_updated') {
+            const goal = normalizeThreadGoal(data.goal)
+            if (!goal) return null
+            return {
+                id: messageId,
+                localId,
+                createdAt,
+                role: 'event',
+                content: {
+                    type: 'thread-goal-updated',
+                    threadId: asString(data.threadId ?? data.thread_id) ?? goal.threadId,
+                    turnId: asString(data.turnId ?? data.turn_id) ?? undefined,
+                    goal
+                },
+                isSidechain: false,
+                meta
+            }
+        }
+
+        if (data.type === 'thread_goal_cleared') {
+            return {
+                id: messageId,
+                localId,
+                createdAt,
+                role: 'event',
+                content: {
+                    type: 'thread-goal-cleared',
+                    threadId: asString(data.threadId ?? data.thread_id) ?? undefined
+                },
+                isSidechain: false,
+                meta
+            }
         }
 
         if (data.type === 'tool-call' && typeof data.callId === 'string') {

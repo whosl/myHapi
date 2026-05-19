@@ -252,6 +252,31 @@ export class ApiClient {
         return await this.request<FileSearchResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/files${qs ? `?${qs}` : ''}`)
     }
 
+    async getGeneratedImageBlob(sessionId: string, imageId: string, attempt: number = 0, overrideToken?: string | null): Promise<Blob> {
+        const headers = new Headers()
+        const liveToken = this.getToken ? this.getToken() : null
+        const authToken = overrideToken !== undefined
+            ? (overrideToken ?? (liveToken ?? this.token))
+            : (liveToken ?? this.token)
+        if (authToken) {
+            headers.set('authorization', `Bearer ${authToken}`)
+        }
+        const res = await fetch(this.buildUrl(`/api/sessions/${encodeURIComponent(sessionId)}/generated-images/${encodeURIComponent(imageId)}`), {
+            headers
+        })
+        if (res.status === 401 && attempt === 0 && this.onUnauthorized) {
+            const refreshed = await this.onUnauthorized()
+            if (refreshed) {
+                this.token = refreshed
+                return await this.getGeneratedImageBlob(sessionId, imageId, attempt + 1, refreshed)
+            }
+        }
+        if (!res.ok) {
+            throw new ApiError(`HTTP ${res.status}`, res.status, undefined, await res.text().catch(() => undefined))
+        }
+        return await res.blob()
+    }
+
     async readSessionFile(sessionId: string, path: string): Promise<FileReadResponse> {
         const params = new URLSearchParams()
         params.set('path', path)
@@ -297,35 +322,14 @@ export class ApiClient {
         return response.sessionId
     }
 
-    async importClaudeHistory(sessionId: string, claudeSessionId: string, workingDirectory: string): Promise<{ imported: number }> {
-        const response = await this.request<{ ok: boolean; imported: number }>(
-            `/api/sessions/${encodeURIComponent(sessionId)}/import-history`,
-            {
-                method: 'POST',
-                body: JSON.stringify({ claudeSessionId, workingDirectory })
-            }
-        )
-        return { imported: response.imported }
-    }
-
-    async importCodexHistory(sessionId: string, codexSessionId: string, workingDirectory: string): Promise<{ imported: number }> {
-        const response = await this.request<{ ok: boolean; imported: number }>(
-            `/api/sessions/${encodeURIComponent(sessionId)}/import-history`,
-            {
-                method: 'POST',
-                body: JSON.stringify({ codexSessionId, workingDirectory })
-            }
-        )
-        return { imported: response.imported }
-    }
-
-    async sendMessage(sessionId: string, text: string, localId?: string | null, attachments?: AttachmentMetadata[]): Promise<void> {
+    async sendMessage(sessionId: string, text: string, localId?: string | null, attachments?: AttachmentMetadata[], scheduledAt?: number | null): Promise<void> {
         await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
             method: 'POST',
             body: JSON.stringify({
                 text,
                 localId: localId ?? undefined,
-                attachments: attachments ?? undefined
+                attachments: attachments ?? undefined,
+                scheduledAt: scheduledAt ?? undefined
             })
         })
     }
@@ -465,30 +469,17 @@ export class ApiClient {
         yolo?: boolean,
         sessionType?: 'simple' | 'worktree',
         worktreeName?: string,
-        effort?: string,
-        resumeSessionId?: string
+        effort?: string
     ): Promise<SpawnResponse> {
         return await this.request<SpawnResponse>(`/api/machines/${encodeURIComponent(machineId)}/spawn`, {
             method: 'POST',
-            body: JSON.stringify({ directory, agent, model, modelReasoningEffort, yolo, sessionType, worktreeName, effort, resumeSessionId })
+            body: JSON.stringify({ directory, agent, model, modelReasoningEffort, yolo, sessionType, worktreeName, effort })
         })
     }
 
     async getMachineCodexModels(machineId: string): Promise<CodexModelsResponse> {
         return await this.request<CodexModelsResponse>(
             `/api/machines/${encodeURIComponent(machineId)}/codex-models`
-        )
-    }
-
-    async listClaudeSessions(machineId: string, workingDirectory: string): Promise<{ success: boolean; sessions?: Array<{ sessionId: string; lastModified: number; size: number; cwd: string }>; error?: string }> {
-        return await this.request<{ success: boolean; sessions?: Array<{ sessionId: string; lastModified: number; size: number; cwd: string }>; error?: string }>(
-            `/api/machines/${encodeURIComponent(machineId)}/claude-sessions?workingDirectory=${encodeURIComponent(workingDirectory)}`
-        )
-    }
-
-    async listCodexSessions(machineId: string, workingDirectory: string): Promise<{ success: boolean; sessions?: Array<{ sessionId: string; lastModified: number; size: number; cwd: string }>; error?: string }> {
-        return await this.request<{ success: boolean; sessions?: Array<{ sessionId: string; lastModified: number; size: number; cwd: string }>; error?: string }>(
-            `/api/machines/${encodeURIComponent(machineId)}/codex-sessions?workingDirectory=${encodeURIComponent(workingDirectory)}`
         )
     }
 

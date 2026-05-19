@@ -18,6 +18,8 @@ export type {
     TeamMessage,
     TeamState,
     TeamTask,
+    ThreadGoal,
+    ThreadGoalStatus,
     TodoItem,
     WorktreeMetadata
 } from '@hapi/protocol/types'
@@ -32,6 +34,9 @@ export type SessionMetadataSummary = {
     machineId?: string
     tools?: string[]
     flavor?: string | null
+    capabilities?: {
+        terminal?: boolean
+    }
     worktree?: WorktreeMetadata
 }
 

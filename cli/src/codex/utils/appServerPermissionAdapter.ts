@@ -2,7 +2,6 @@ import { randomUUID } from 'node:crypto';
 import { logger } from '@/ui/logger';
 import type { CodexPermissionHandler } from './permissionHandler';
 import type { CodexAppServerClient } from '../codexAppServerClient';
-import type { ServerRequestResolvedDecision } from '../appServerTypes';
 
 type PermissionDecision = 'approved' | 'approved_for_session' | 'denied' | 'abort';
 
@@ -30,6 +29,15 @@ function asString(value: unknown): string | undefined {
     return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
+function pickToolName(record: Record<string, unknown>): string {
+    return asString(record.toolName)
+        ?? asString(record.tool_name)
+        ?? asString(record.tool)
+        ?? asString(record.name)
+        ?? asString(record.permission)
+        ?? 'CodexTool';
+}
+
 function mapDecision(decision: PermissionDecision): { decision: string } {
     switch (decision) {
         case 'approved':
@@ -43,17 +51,27 @@ function mapDecision(decision: PermissionDecision): { decision: string } {
     }
 }
 
-function mapDecisionToResolved(decision: PermissionDecision): ServerRequestResolvedDecision {
-    switch (decision) {
-        case 'approved':
-            return 'accept';
-        case 'approved_for_session':
-            return 'acceptForSession';
-        case 'denied':
-            return 'decline';
-        case 'abort':
-            return 'cancel';
+function mapPermissionGrant(
+    requested: unknown,
+    decision: PermissionDecision
+): {
+    permissions: unknown;
+    scope: 'turn' | 'session';
+} {
+    if (decision === 'approved' || decision === 'approved_for_session') {
+        return {
+            permissions: requested,
+            scope: decision === 'approved_for_session' ? 'session' : 'turn'
+        };
     }
+
+    return {
+        permissions: {
+            network: null,
+            fileSystem: null
+        },
+        scope: 'turn'
+    };
 }
 
 function firstString(values: unknown): string | undefined {
@@ -136,51 +154,6 @@ function isHapiBridgeElicitation(params: unknown): boolean {
     return record?.serverName === 'hapi';
 }
 
-async function handlePermissionWithExplicitApproval(
-    client: CodexAppServerClient,
-    permissionHandler: CodexPermissionHandler,
-    requestId: string,
-    toolName: string,
-    toolInput: Record<string, unknown>
-): Promise<{ pending: true }> {
-    permissionHandler.handleToolCall(requestId, toolName, toolInput).then(result => {
-        const permissionResult = result as PermissionResult;
-        client.resolveServerRequest({
-            requestId,
-            decision: mapDecisionToResolved(permissionResult.decision),
-            reason: permissionResult.reason
-        }).catch(error => {
-            logger.debug('[CodexAppServer] Failed to resolve explicit approval request', error);
-        });
-    }).catch(error => {
-        logger.debug('[CodexAppServer] Permission handler failed, resolving as cancel', error);
-        client.resolveServerRequest({
-            requestId,
-            decision: 'cancel',
-            reason: error instanceof Error ? error.message : String(error)
-        }).catch(err => {
-            logger.debug('[CodexAppServer] Failed to send cancel resolution', err);
-        });
-    });
-
-    return { pending: true };
-}
-
-async function handlePermissionLegacy(
-    permissionHandler: CodexPermissionHandler,
-    toolCallId: string,
-    toolName: string,
-    toolInput: Record<string, unknown>
-): Promise<{ decision: string }> {
-    const result = await permissionHandler.handleToolCall(
-        toolCallId,
-        toolName,
-        toolInput
-    ) as PermissionResult;
-
-    return mapDecision(result.decision);
-}
-
 export function registerAppServerPermissionHandlers(args: {
     client: CodexAppServerClient;
     permissionHandler: CodexPermissionHandler;
@@ -190,72 +163,75 @@ export function registerAppServerPermissionHandlers(args: {
     >;
 }): void {
     const { client, permissionHandler, onUserInputRequest } = args;
-    const useExplicitApproval = client.hasCapability('serverRequest/resolved');
-
-    if (useExplicitApproval) {
-        logger.debug('[CodexAppServer] Using explicit approval flow (serverRequest/resolved)');
-    }
 
     client.registerRequestHandler('item/commandExecution/requestApproval', async (params) => {
         const record = asRecord(params) ?? {};
-        const requestId = asString(record.requestId ?? record.itemId) ?? randomUUID();
+        const toolCallId = asString(record.itemId) ?? randomUUID();
         const reason = asString(record.reason);
         const command = record.command;
         const cwd = asString(record.cwd);
 
-        const toolInput = { message: reason, command, cwd };
+        const result = await permissionHandler.handleToolCall(
+            toolCallId,
+            'CodexBash',
+            {
+                message: reason,
+                command,
+                cwd
+            }
+        ) as PermissionResult;
 
-        if (useExplicitApproval) {
-            return handlePermissionWithExplicitApproval(
-                client, permissionHandler, requestId, 'CodexBash', toolInput
-            );
-        }
-
-        return handlePermissionLegacy(permissionHandler, requestId, 'CodexBash', toolInput);
+        return mapDecision(result.decision);
     });
 
     client.registerRequestHandler('item/fileChange/requestApproval', async (params) => {
         const record = asRecord(params) ?? {};
-        const requestId = asString(record.requestId ?? record.itemId) ?? randomUUID();
+        const toolCallId = asString(record.itemId) ?? randomUUID();
         const reason = asString(record.reason);
         const grantRoot = asString(record.grantRoot);
 
-        const toolInput = { message: reason, grantRoot };
+        const result = await permissionHandler.handleToolCall(
+            toolCallId,
+            'CodexPatch',
+            {
+                message: reason,
+                grantRoot
+            }
+        ) as PermissionResult;
 
-        if (useExplicitApproval) {
-            return handlePermissionWithExplicitApproval(
-                client, permissionHandler, requestId, 'CodexPatch', toolInput
-            );
-        }
-
-        return handlePermissionLegacy(permissionHandler, requestId, 'CodexPatch', toolInput);
+        return mapDecision(result.decision);
     });
 
-    client.registerRequestHandler('mcpServer/elicitation/request', async (params) => {
+    client.registerRequestHandler('item/permissions/requestApproval', async (params) => {
         const record = asRecord(params) ?? {};
-        const requestId = asString(record.requestId ?? record.id) ?? randomUUID();
-        const message = asString(record.message) ?? 'MCP server requests input';
+        const toolCallId = asString(record.itemId) ?? randomUUID();
+        const permissions = record.permissions ?? {};
 
-        logger.debug(`[CodexAppServer] mcpServer/elicitation/request received`, { requestId, message });
-
-        if (onUserInputRequest) {
-            try {
-                const result = await onUserInputRequest({
-                    id: requestId,
-                    input: params
-                });
-                if (result.decision === 'accept') {
-                    return result;
-                }
-                return { decision: 'cancel' };
-            } catch (error) {
-                logger.debug(`[CodexAppServer] elicitation request failed: ${error}`);
-                return { decision: 'cancel' };
+        const result = await permissionHandler.handleToolCall(
+            toolCallId,
+            'CodexPermission',
+            {
+                message: asString(record.reason),
+                cwd: asString(record.cwd),
+                permissions
             }
-        }
+        ) as PermissionResult;
 
-        // Auto-approve elicitation requests when no user-input handler is available
-        return { decision: 'accept', answers: {} };
+        return mapPermissionGrant(permissions, result.decision);
+    });
+
+    client.registerRequestHandler('item/tool/requestApproval', async (params) => {
+        const record = asRecord(params) ?? {};
+        const toolCallId = asString(record.itemId) ?? asString(record.item_id) ?? randomUUID();
+        const toolName = pickToolName(record);
+
+        const result = await permissionHandler.handleToolCall(
+            toolCallId,
+            toolName,
+            record.input ?? record.arguments ?? params
+        ) as PermissionResult;
+
+        return mapDecision(result.decision);
     });
 
     client.registerRequestHandler('item/tool/requestUserInput', async (params) => {

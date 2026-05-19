@@ -9,6 +9,10 @@ const MetadataSummarySchema = z.object({
     updatedAt: z.number()
 })
 
+const SessionCapabilitiesSchema = z.object({
+    terminal: z.boolean().optional()
+})
+
 export const WorktreeMetadataSchema = z.object({
     basePath: z.string(),
     branch: z.string(),
@@ -46,6 +50,7 @@ export const MetadataSchema = z.object({
     archivedBy: z.string().optional(),
     archiveReason: z.string().optional(),
     flavor: z.string().nullish(),
+    capabilities: SessionCapabilitiesSchema.optional(),
     worktree: WorktreeMetadataSchema.optional()
 })
 
@@ -138,6 +143,22 @@ export const TeamStateSchema = z.object({
 
 export type TeamState = z.infer<typeof TeamStateSchema>
 
+export const ThreadGoalStatusSchema = z.enum(['active', 'paused', 'budgetLimited', 'complete'])
+export type ThreadGoalStatus = z.infer<typeof ThreadGoalStatusSchema>
+
+export const ThreadGoalSchema = z.object({
+    threadId: z.string(),
+    objective: z.string(),
+    status: ThreadGoalStatusSchema,
+    tokenBudget: z.number().nullable().optional(),
+    tokensUsed: z.number().optional().default(0),
+    timeUsedSeconds: z.number().optional().default(0),
+    createdAt: z.number().optional().default(0),
+    updatedAt: z.number().optional().default(0)
+})
+
+export type ThreadGoal = z.infer<typeof ThreadGoalSchema>
+
 export const AttachmentMetadataSchema = z.object({
     id: z.string(),
     filename: z.string(),
@@ -155,7 +176,8 @@ export const DecryptedMessageSchema = z.object({
     localId: z.string().nullable(),
     content: z.unknown(),
     createdAt: z.number(),
-    invokedAt: z.number().nullable().optional()
+    invokedAt: z.number().nullable().optional(),
+    scheduledAt: z.number().nullable().optional()
 })
 
 export type DecryptedMessage = z.infer<typeof DecryptedMessageSchema>

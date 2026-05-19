@@ -10,6 +10,7 @@ import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
 import { CopyIcon, CheckIcon } from '@/components/icons'
 import { cn } from '@/lib/utils'
 import { useTranslation } from '@/lib/use-translation'
+import { DEFAULT_SESSION_PREVIEW_LIMIT, useSessionPreviewLimit } from '@/hooks/useSessionPreviewLimit'
 
 type SessionGroup = {
     key: string
@@ -91,7 +92,7 @@ function getGroupDisplayName(directory: string): string {
 }
 
 export const UNKNOWN_MACHINE_ID = '__unknown__'
-export const GROUP_SESSION_PREVIEW_LIMIT = 8
+export const GROUP_SESSION_PREVIEW_LIMIT = DEFAULT_SESSION_PREVIEW_LIMIT
 
 export function deduplicateSessionsByAgentId(sessions: SessionSummary[], selectedSessionId?: string | null): SessionSummary[] {
     const byAgentId = new Map<string, SessionSummary[]>()
@@ -687,6 +688,7 @@ export function SessionList(props: {
     sessions: SessionSummary[]
     onSelect: (sessionId: string) => void
     onNewSession: () => void
+    onNewSessionInDirectory?: (args: { machineId: string | null; directory: string }) => void
     onBrowse?: () => void
     onRefresh: () => void
     isLoading: boolean
@@ -696,7 +698,8 @@ export function SessionList(props: {
     selectedSessionId?: string | null
 }) {
     const { t } = useTranslation()
-    const { renderHeader = true, api, selectedSessionId, machineLabelsById = {} } = props
+    const { renderHeader = true, api, selectedSessionId, machineLabelsById = {}, onNewSessionInDirectory } = props
+    const { sessionPreviewLimit } = useSessionPreviewLimit()
     const [searchQuery, setSearchQuery] = useState('')
     const normalizedQuery = normalizeSearch(searchQuery)
     const isSearching = normalizedQuery.length > 0
@@ -755,7 +758,7 @@ export function SessionList(props: {
     }
 
     const isSessionGroupExpanded = (group: SessionGroup): boolean => {
-        if (isSearching || group.sessions.length <= GROUP_SESSION_PREVIEW_LIMIT) return true
+        if (isSearching || group.sessions.length <= sessionPreviewLimit) return true
         const key = `sessions::${group.key}`
         const override = collapseOverrides.get(key)
         if (override !== undefined) return !override
@@ -777,7 +780,8 @@ export function SessionList(props: {
             group.sessions,
             {
                 expanded: isSessionGroupExpanded(group),
-                selectedSessionId
+                selectedSessionId,
+                limit: sessionPreviewLimit
             }
         )
     }
@@ -905,6 +909,7 @@ export function SessionList(props: {
                                         const visibleGroupSessions = getVisibleGroupSessions(group)
                                         const hiddenSessionCount = group.sessions.length - visibleGroupSessions.length
                                         const sessionGroupExpanded = isSessionGroupExpanded(group)
+                                        const canStartInGroupDirectory = group.directory !== 'Other'
                                         return (
                                             <div key={group.key}>
                                                 <div
@@ -917,6 +922,23 @@ export function SessionList(props: {
                                                         {group.displayName}
                                                     </span>
                                                     <CopyPathButton path={group.directory} className="opacity-0 group-hover/project:opacity-100 transition-opacity duration-150" />
+                                                    {onNewSessionInDirectory && canStartInGroupDirectory ? (
+                                                        <button
+                                                            type="button"
+                                                            onClick={(event) => {
+                                                                event.stopPropagation()
+                                                                onNewSessionInDirectory({
+                                                                    machineId: group.machineId,
+                                                                    directory: group.directory
+                                                                })
+                                                            }}
+                                                            className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[var(--app-hint)] opacity-70 transition-colors hover:bg-[var(--app-secondary-bg)] hover:text-[var(--app-link)] hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)]"
+                                                            title={t('sessions.group.new')}
+                                                            aria-label={t('sessions.group.new')}
+                                                        >
+                                                            <PlusIcon className="h-3.5 w-3.5" />
+                                                        </button>
+                                                    ) : null}
                                                     <span className="text-[11px] tabular-nums text-[var(--app-hint)] shrink-0">
                                                         ({group.sessions.length})
                                                     </span>
@@ -936,7 +958,7 @@ export function SessionList(props: {
                                                                 selected={s.id === selectedSessionId}
                                                             />
                                                         ))}
-                                                        {!isSearching && group.sessions.length > GROUP_SESSION_PREVIEW_LIMIT && (sessionGroupExpanded || hiddenSessionCount > 0) ? (
+                                                        {!isSearching && group.sessions.length > sessionPreviewLimit && (sessionGroupExpanded || hiddenSessionCount > 0) ? (
                                                             <button
                                                                 type="button"
                                                                 onClick={() => toggleSessionGroup(group)}

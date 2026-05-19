@@ -184,7 +184,10 @@ export function WorkspaceBrowser(props: {
         () => machineId ? machines.find(m => m.id === machineId) ?? null : null,
         [machineId, machines]
     )
-    const workspaceRoots = selectedMachine?.metadata?.workspaceRoots ?? []
+    const workspaceRoots = useMemo(
+        () => selectedMachine?.metadata?.workspaceRoots ?? [],
+        [selectedMachine?.metadata?.workspaceRoots]
+    )
 
     const loadDirectory = useCallback(async (path: string) => {
         if (!machineId) return
@@ -226,9 +229,10 @@ export function WorkspaceBrowser(props: {
         void loadDirectory(selectedRoot)
     }, [machineId, selectedRoot, currentPath, loadDirectory])
 
-    // If switching machines, reset view
+    // 切换机器时才重置浏览状态；workspaceRoots 的刷新由上面的 effect
+    // 只做 root 有效性校正，避免 metadata 更新时清空用户当前浏览位置。
     useEffect(() => {
-        setSelectedRoot(null)
+        setSelectedRoot(workspaceRoots[0] ?? null)
         setCurrentPath(null)
         setEntries([])
         setError(null)

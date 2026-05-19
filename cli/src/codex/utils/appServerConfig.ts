@@ -139,6 +139,7 @@ export function buildTurnStartParams(args: {
         approvalPolicy?: TurnStartParams['approvalPolicy'];
         sandboxPolicy?: TurnStartParams['sandboxPolicy'];
         model?: string;
+        suppressCollaborationMode?: boolean;
     };
 }): TurnStartParams {
     const params: TurnStartParams = {
@@ -163,11 +164,14 @@ export function buildTurnStartParams(args: {
         params.sandboxPolicy = sandboxPolicy;
     }
 
-    const collaborationMode = args.mode?.collaborationMode;
+    const collaborationMode = args.overrides?.suppressCollaborationMode
+        ? undefined
+        : args.mode?.collaborationMode;
     const model = args.overrides?.model ?? args.mode?.model;
+    const modelReasoningEffort = args.mode?.modelReasoningEffort;
 
-    if (args.mode?.modelReasoningEffort) {
-        params.effort = args.mode.modelReasoningEffort;
+    if (modelReasoningEffort) {
+        params.effort = modelReasoningEffort;
         if (!collaborationMode && supportsReasoningSummary(model)) {
             params.summary = 'detailed';
         }
@@ -182,6 +186,7 @@ export function buildTurnStartParams(args: {
             mode: collaborationMode,
             settings: {
                 model,
+                reasoning_effort: modelReasoningEffort ?? null,
                 developer_instructions: appendCollaborationInstructions(developerInstructions)
             }
         };

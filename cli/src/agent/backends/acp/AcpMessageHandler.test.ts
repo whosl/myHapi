@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { AgentMessage } from '@/agent/types';
 import { AcpMessageHandler } from './AcpMessageHandler';
 import { ACP_SESSION_UPDATE_TYPES } from './constants';
@@ -658,7 +660,7 @@ describe('AcpMessageHandler', () => {
         expect((messages[0] as { text: string }).text).toMatch(/^Claude AI usage limit warning\|/);
     });
 
-    it('forwards agent_thought_chunk as a reasoning message', () => {
+    it('forwards agent_thought_chunk as a reasoning message after flush', () => {
         const messages: AgentMessage[] = [];
         const handler = new AcpMessageHandler((message) => messages.push(message));
 
@@ -667,6 +669,9 @@ describe('AcpMessageHandler', () => {
             content: { type: 'text', text: 'thinking about the problem' }
         });
 
+        // Chunks are buffered, not emitted inline.
+        expect(messages).toHaveLength(0);
+        handler.flushReasoning();
         expect(messages).toHaveLength(1);
         expect(messages[0]).toEqual({ type: 'reasoning', text: 'thinking about the problem' });
     });
@@ -697,16 +702,16 @@ describe('AcpMessageHandler', () => {
             content: { type: 'text', text: 'mid-stream thought' }
         });
 
+        // The thought chunk must not flush the live text buffer — otherwise
+        // a single text segment would split across two messages.
+        handler.flushReasoning();
         handler.flushText();
 
-        // Both messages are delivered intact with no loss. Reasoning is
-        // emitted inline (see AcpMessageHandler) so it precedes the
-        // flushed text segment — this is an intentional contract to let
-        // thoughts and text interleave without splitting a live segment.
         expect(messages).toHaveLength(2);
+        // Reasoning was buffered separately and is now delivered as a single
+        // coalesced message. The text buffer survived the thought.
         expect(messages).toContainEqual({ type: 'reasoning', text: 'mid-stream thought' });
         expect(messages).toContainEqual({ type: 'text', text: 'partial answer' });
-        expect(messages[0]).toEqual({ type: 'reasoning', text: 'mid-stream thought' });
     });
 
     it('does not drop thought chunks annotated with a non-assistant audience', () => {
@@ -721,32 +726,155 @@ describe('AcpMessageHandler', () => {
                 annotations: { audience: ['user'] }
             }
         });
+        handler.flushReasoning();
 
         expect(messages).toHaveLength(1);
         expect(messages[0]).toEqual({ type: 'reasoning', text: 'private reasoning' });
     });
 
-    it('forwards sequential thought chunks in arrival order as separate reasoning messages', () => {
+    it('coalesces sequential thought chunks into a single reasoning message', () => {
         const messages: AgentMessage[] = [];
         const handler = new AcpMessageHandler((message) => messages.push(message));
 
         handler.handleUpdate({
             sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentThoughtChunk,
-            content: { type: 'text', text: 'first thought' }
+            content: { type: 'text', text: 'first thought ' }
         });
         handler.handleUpdate({
             sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentThoughtChunk,
-            content: { type: 'text', text: 'second thought' }
+            content: { type: 'text', text: 'second thought ' }
         });
         handler.handleUpdate({
             sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentThoughtChunk,
             content: { type: 'text', text: 'third thought' }
         });
+        handler.flushReasoning();
+
+        // OpenCode/Zen streams thoughts at one chunk per token; emitting
+        // each chunk as its own reasoning message made the web reducer
+        // render one row per token. The handler now coalesces a thought
+        // segment into a single reasoning message.
+        expect(messages).toEqual([
+            { type: 'reasoning', text: 'first thought second thought third thought' }
+        ]);
+    });
+
+    it('emits buffered reasoning before a tool_call boundary', () => {
+        const messages: AgentMessage[] = [];
+        const handler = new AcpMessageHandler((message) => messages.push(message));
+
+        handler.handleUpdate({
+            sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentThoughtChunk,
+            content: { type: 'text', text: 'I should call the tool. ' }
+        });
+        handler.handleUpdate({
+            sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentThoughtChunk,
+            content: { type: 'text', text: 'Calling now.' }
+        });
+        handler.handleUpdate({
+            sessionUpdate: ACP_SESSION_UPDATE_TYPES.toolCall,
+            toolCallId: 'tc-1',
+            title: 'do_thing',
+            kind: 'execute',
+            rawInput: { foo: 1 },
+            status: 'in_progress'
+        });
+
+        // Reasoning is coalesced and emitted before the tool call so the
+        // arrival order between thought and tool lifecycle is preserved.
+        expect(messages[0]).toEqual({
+            type: 'reasoning',
+            text: 'I should call the tool. Calling now.'
+        });
+        expect(messages[1]).toMatchObject({ type: 'tool_call', id: 'tc-1' });
+    });
+
+    // Locks the flush-before-every-non-thought-boundary contract introduced
+    // in this fix: a future refactor that forgets to call flushReasoning() in
+    // one branch of handleUpdate would otherwise silently regress reasoning
+    // ordering for that update type.
+    it.each([
+        [
+            'agentMessageChunk',
+            {
+                sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentMessageChunk,
+                content: { type: 'text', text: 'visible answer' }
+            }
+        ],
+        [
+            'toolCall',
+            {
+                sessionUpdate: ACP_SESSION_UPDATE_TYPES.toolCall,
+                toolCallId: 'tc-x',
+                title: 'do_thing',
+                kind: 'execute',
+                rawInput: {},
+                status: 'in_progress'
+            }
+        ],
+        [
+            'plan',
+            {
+                sessionUpdate: ACP_SESSION_UPDATE_TYPES.plan,
+                entries: [{ content: 'Step 1', priority: 'high', status: 'pending' }]
+            }
+        ]
+    ])('flushes buffered reasoning before %s', (_label, boundaryUpdate) => {
+        const messages: AgentMessage[] = [];
+        const handler = new AcpMessageHandler((message) => messages.push(message));
+
+        handler.handleUpdate({
+            sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentThoughtChunk,
+            content: { type: 'text', text: 'thinking first' }
+        });
+        handler.handleUpdate(boundaryUpdate);
+        handler.drainBuffers();
+
+        // Reasoning must arrive at index 0, before anything the boundary
+        // update produced.
+        expect(messages[0]).toEqual({ type: 'reasoning', text: 'thinking first' });
+        expect(messages.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it('drops whitespace-only buffered reasoning rather than emitting an empty bubble', () => {
+        const messages: AgentMessage[] = [];
+        const handler = new AcpMessageHandler((message) => messages.push(message));
+
+        handler.handleUpdate({
+            sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentThoughtChunk,
+            content: { type: 'text', text: '   ' }
+        });
+        handler.handleUpdate({
+            sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentThoughtChunk,
+            content: { type: 'text', text: '\n\n' }
+        });
+        handler.drainBuffers();
+
+        // A whitespace-only reasoning bubble in the web UI is visible only as
+        // empty space — drop it instead.
+        expect(messages.filter((m) => m.type === 'reasoning')).toEqual([]);
+    });
+
+    it('drainBuffers emits reasoning before any pending text', () => {
+        const messages: AgentMessage[] = [];
+        const handler = new AcpMessageHandler((message) => messages.push(message));
+
+        // Build up text and reasoning together — text first, then thought
+        // interleaved (per the existing intra-segment contract).
+        handler.handleUpdate({
+            sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentMessageChunk,
+            content: { type: 'text', text: 'visible' }
+        });
+        handler.handleUpdate({
+            sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentThoughtChunk,
+            content: { type: 'text', text: 'silent' }
+        });
+
+        handler.drainBuffers();
 
         expect(messages).toEqual([
-            { type: 'reasoning', text: 'first thought' },
-            { type: 'reasoning', text: 'second thought' },
-            { type: 'reasoning', text: 'third thought' }
+            { type: 'reasoning', text: 'silent' },
+            { type: 'text', text: 'visible' }
         ]);
     });
 
@@ -1241,7 +1369,7 @@ describe('AcpMessageHandler', () => {
         // include rawInput in tool_call events and emits prose (non-JSON)
         // thoughts. There is therefore no JSON-thought-hoisting trigger —
         // tool_call input is null and the thought text surfaces as reasoning.
-        const fixtureDir = new URL('./__fixtures__', import.meta.url).pathname;
+        const fixtureDir = fileURLToPath(new URL('./__fixtures__', import.meta.url));
 
         const fixtures = [
             {
@@ -1249,14 +1377,14 @@ describe('AcpMessageHandler', () => {
                 // model expresses reasoning as a `kind: think` tool_call rather
                 // than as a thought chunk, so the reasoning channel is empty.
                 name: 'gemini-3-flash-preview / read_file',
-                file: `${fixtureDir}/gemini-3-flash-preview-read-file.json`,
+                file: join(fixtureDir, 'gemini-3-flash-preview-read-file.json'),
                 expectedMinToolCalls: 2,
                 expectedMinReasoning: 0,
                 hasMessageChunks: true,
             },
             {
                 name: 'gemini-3-flash-preview / run_shell',
-                file: `${fixtureDir}/gemini-3-flash-preview-run-shell.json`,
+                file: join(fixtureDir, 'gemini-3-flash-preview-run-shell.json'),
                 expectedMinToolCalls: 1,
                 expectedMinReasoning: 1,
                 hasMessageChunks: true,
@@ -1265,7 +1393,7 @@ describe('AcpMessageHandler', () => {
                 // write_file: kind=edit, locations carries the file path.
                 // Same shape (and zero thought chunks) as read_file.
                 name: 'gemini-3-flash-preview / write_file',
-                file: `${fixtureDir}/gemini-3-flash-preview-write-file.json`,
+                file: join(fixtureDir, 'gemini-3-flash-preview-write-file.json'),
                 expectedMinToolCalls: 2,
                 expectedMinReasoning: 0,
                 hasMessageChunks: true,
@@ -1273,7 +1401,7 @@ describe('AcpMessageHandler', () => {
             {
                 // replace (in-place edit): same kind=edit + locations pattern.
                 name: 'gemini-3-flash-preview / edit_file',
-                file: `${fixtureDir}/gemini-3-flash-preview-edit-file.json`,
+                file: join(fixtureDir, 'gemini-3-flash-preview-edit-file.json'),
                 expectedMinToolCalls: 2,
                 expectedMinReasoning: 0,
                 hasMessageChunks: true,
@@ -1285,7 +1413,7 @@ describe('AcpMessageHandler', () => {
             // assertions below match the flash captures.
             {
                 name: 'gemini-3.1-pro-preview / read_file',
-                file: `${fixtureDir}/gemini-3.1-pro-preview-read-file.json`,
+                file: join(fixtureDir, 'gemini-3.1-pro-preview-read-file.json'),
                 expectedMinToolCalls: 2,
                 expectedMinReasoning: 0,
                 hasMessageChunks: true,
@@ -1294,7 +1422,7 @@ describe('AcpMessageHandler', () => {
                 // run_shell: pro emits a single agent_thought_chunk in addition
                 // to the execute tool_call.
                 name: 'gemini-3.1-pro-preview / run_shell',
-                file: `${fixtureDir}/gemini-3.1-pro-preview-run-shell.json`,
+                file: join(fixtureDir, 'gemini-3.1-pro-preview-run-shell.json'),
                 expectedMinToolCalls: 1,
                 expectedMinReasoning: 1,
                 hasMessageChunks: true,
@@ -1302,7 +1430,7 @@ describe('AcpMessageHandler', () => {
             {
                 // write_file: kind=edit, locations carries the file path.
                 name: 'gemini-3.1-pro-preview / write_file',
-                file: `${fixtureDir}/gemini-3.1-pro-preview-write-file.json`,
+                file: join(fixtureDir, 'gemini-3.1-pro-preview-write-file.json'),
                 expectedMinToolCalls: 1,
                 expectedMinReasoning: 0,
                 hasMessageChunks: true,
@@ -1311,7 +1439,7 @@ describe('AcpMessageHandler', () => {
                 // replace (in-place edit): pro version interleaves think + read
                 // + edit kinds before the final agent_message_chunk burst.
                 name: 'gemini-3.1-pro-preview / edit_file',
-                file: `${fixtureDir}/gemini-3.1-pro-preview-edit-file.json`,
+                file: join(fixtureDir, 'gemini-3.1-pro-preview-edit-file.json'),
                 expectedMinToolCalls: 2,
                 expectedMinReasoning: 0,
                 hasMessageChunks: true,
@@ -1660,9 +1788,9 @@ describe('AcpMessageHandler', () => {
 
         it('replays write_file fixture and produces Write-shaped tool_call input', () => {
             // Integration: full fixture replay must produce Write with {file_path, content}
-            const fixtureDir = new URL('./__fixtures__', import.meta.url).pathname;
+            const fixtureDir = fileURLToPath(new URL('./__fixtures__', import.meta.url));
             // eslint-disable-next-line @typescript-eslint/no-require-imports
-            const data = require(`${fixtureDir}/gemini-3-flash-preview-write-file.json`) as {
+            const data = require(join(fixtureDir, 'gemini-3-flash-preview-write-file.json')) as {
                 updates: unknown[];
             };
 
@@ -1688,9 +1816,9 @@ describe('AcpMessageHandler', () => {
 
         it('replays edit_file fixture and produces Edit-shaped tool_call input', () => {
             // Integration: full fixture replay must produce Edit with {file_path, old_string, new_string}
-            const fixtureDir = new URL('./__fixtures__', import.meta.url).pathname;
+            const fixtureDir = fileURLToPath(new URL('./__fixtures__', import.meta.url));
             // eslint-disable-next-line @typescript-eslint/no-require-imports
-            const data = require(`${fixtureDir}/gemini-3-flash-preview-edit-file.json`) as {
+            const data = require(join(fixtureDir, 'gemini-3-flash-preview-edit-file.json')) as {
                 updates: unknown[];
             };
 

@@ -564,8 +564,9 @@ export function getToolPresentation(
     const pattern = getInputStringAny(opts.input, ['pattern'])
     const url = getInputStringAny(opts.input, ['url'])
     const query = getInputStringAny(opts.input, ['query'])
+    const name = getInputStringAny(opts.input, ['name'])
 
-    const subtitle = filePath ?? command ?? pattern ?? url ?? query
+    const subtitle = filePath ?? command ?? pattern ?? url ?? query ?? name
 
     // Some ACP agents emit `tool_call.title` as a verbatim argument (the shell
     // command or the file path itself). When it equals the input field,

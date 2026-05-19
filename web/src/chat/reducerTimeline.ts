@@ -1,4 +1,4 @@
-import type { AgentReasoningBlock, AgentTextBlock, ChatBlock, CliOutputBlock, ToolCallBlock, ToolPermission } from '@/chat/types'
+import type { AgentReasoningBlock, AgentTextBlock, ChatBlock, CliOutputBlock, CodexReviewBlock, ToolCallBlock, ToolPermission } from '@/chat/types'
 import type { TracedMessage } from '@/chat/tracer'
 import { createCliOutputBlock, isCliOutputText, mergeCliOutputBlocks } from '@/chat/reducerCliOutput'
 import { parseMessageAsEvent } from '@/chat/reducerEvents'
@@ -437,8 +437,8 @@ export function reduceTimeline(
                 const targetId = msg.content.targetMessageId
                 const durationMs = msg.content.durationMs as number
                 type DurationBearingBlock = AgentTextBlock | AgentReasoningBlock | CliOutputBlock | ToolCallBlock
-                const isDurationTarget = (b: ChatBlock): b is DurationBearingBlock =>
-                    b.kind === 'agent-text' || b.kind === 'agent-reasoning' || b.kind === 'cli-output' || b.kind === 'tool-call'
+                const isDurationTarget = (b: ChatBlock): b is DurationBearingBlock | CodexReviewBlock =>
+                    b.kind === 'agent-text' || b.kind === 'agent-reasoning' || b.kind === 'codex-review' || b.kind === 'cli-output' || b.kind === 'tool-call'
                 let foundIndex = -1
 
                 if (targetId) {
@@ -730,6 +730,21 @@ export function reduceTimeline(
                     continue
                 }
 
+                if (c.type === 'generated-image') {
+                    blocks.push({
+                        kind: 'generated-image',
+                        id: `${msg.id}:${idx}`,
+                        localId: msg.localId,
+                        createdAt: msg.createdAt,
+                        invokedAt: msg.invokedAt,
+                        imageId: c.imageId,
+                        fileName: c.fileName,
+                        mimeType: c.mimeType,
+                        meta: msg.meta
+                    })
+                    continue
+                }
+
                 if (c.type === 'reasoning') {
                     blocks.push({
                         kind: 'agent-reasoning',
@@ -740,6 +755,21 @@ export function reduceTimeline(
                         usage: msg.usage,
                         model: msg.model,
                         text: c.text,
+                        meta: msg.meta
+                    })
+                    continue
+                }
+
+                if (c.type === 'codex-review') {
+                    blocks.push({
+                        kind: 'codex-review',
+                        id: `${msg.id}:${idx}`,
+                        localId: msg.localId,
+                        createdAt: msg.createdAt,
+                        invokedAt: msg.invokedAt,
+                        usage: msg.usage,
+                        model: msg.model,
+                        review: c.review,
                         meta: msg.meta
                     })
                     continue

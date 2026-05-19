@@ -56,6 +56,28 @@ function extractCommand(value: unknown): string | null {
     return null;
 }
 
+function extractGeneratedImagePath(item: Record<string, unknown>): string | null {
+    return asString(
+        item.savedPath
+        ?? item.saved_path
+        ?? item.path
+        ?? item.filePath
+        ?? item.file_path
+        ?? item.outputPath
+        ?? item.output_path
+    );
+}
+
+function extractGeneratedImageMimeType(item: Record<string, unknown>): string | null {
+    return asString(item.mimeType ?? item.mime_type ?? item.mediaType ?? item.media_type);
+}
+
+function extractGeneratedImageFileName(item: Record<string, unknown>, savedPath: string): string {
+    const direct = asString(item.fileName ?? item.file_name ?? item.filename ?? item.name);
+    if (direct) return direct;
+    return savedPath.split(/[\\/]/).filter(Boolean).pop() ?? 'generated-image.png';
+}
+
 function extractChanges(value: unknown): Record<string, unknown> | null {
     const record = asRecord(value);
     if (record) return record;
@@ -228,6 +250,43 @@ function addEventScope(events: ConvertedEvent[], scope: Record<string, unknown>)
     }));
 }
 
+const MAX_UNHANDLED_LOG_STRING_LENGTH = 512;
+const MAX_UNHANDLED_LOG_ARRAY_LENGTH = 20;
+const MAX_UNHANDLED_LOG_DEPTH = 8;
+
+function sanitizeUnhandledNotificationLogValue(value: unknown, depth: number = 0): unknown {
+    if (typeof value === 'string') {
+        if (value.length <= MAX_UNHANDLED_LOG_STRING_LENGTH) {
+            return value;
+        }
+        return `${value.slice(0, MAX_UNHANDLED_LOG_STRING_LENGTH)}... [truncated ${value.length - MAX_UNHANDLED_LOG_STRING_LENGTH} chars for logs]`;
+    }
+
+    if (Array.isArray(value)) {
+        const items = value
+            .slice(0, MAX_UNHANDLED_LOG_ARRAY_LENGTH)
+            .map((item) => sanitizeUnhandledNotificationLogValue(item, depth + 1));
+        if (value.length > MAX_UNHANDLED_LOG_ARRAY_LENGTH) {
+            items.push(`... [truncated ${value.length - MAX_UNHANDLED_LOG_ARRAY_LENGTH} array items for logs]`);
+        }
+        return items;
+    }
+
+    if (!value || typeof value !== 'object') {
+        return value;
+    }
+
+    if (depth >= MAX_UNHANDLED_LOG_DEPTH) {
+        return '[truncated nested object for logs]';
+    }
+
+    const result: Record<string, unknown> = {};
+    for (const [key, nestedValue] of Object.entries(value)) {
+        result[key] = sanitizeUnhandledNotificationLogValue(nestedValue, depth + 1);
+    }
+    return result;
+}
+
 function normalizeCollabAgentToolName(value: unknown): string | null {
     const raw = asString(value);
     if (!raw) return null;
@@ -295,11 +354,22 @@ function statusObjectFromAgentState(value: unknown): unknown {
     const record = asRecord(value);
     if (!record) return value;
 
-    const message = asString(record.message);
+    const message = asString(record.message)
+        ?? asString(record.output)
+        ?? asString(record.result)
+        ?? asString(record.finalMessage)
+        ?? asString(record.final_message);
     const status = asString(record.status ?? record.state);
-    if (status === 'completed' && message) return { completed: message };
-    if ((status === 'failed' || status === 'error') && message) return { failed: message };
-    if ((status === 'canceled' || status === 'cancelled') && message) return { canceled: message };
+    const normalizedStatus = status?.trim().toLowerCase().replace(/[\s_-]/g, '');
+    const completed = normalizedStatus === 'completed'
+        || normalizedStatus === 'complete'
+        || normalizedStatus === 'done'
+        || record.completed === true
+        || record.done === true;
+    if (completed && message) return { completed: message };
+    if (completed) return { ...record, status: 'completed' };
+    if ((normalizedStatus === 'failed' || normalizedStatus === 'error') && message) return { failed: message };
+    if ((normalizedStatus === 'canceled' || normalizedStatus === 'cancelled') && message) return { canceled: message };
     return value;
 }
 
@@ -532,6 +602,34 @@ export class AppServerEventConverter {
                 ...(turnId ? { turn_id: turnId } : {})
             });
             events.push(scoped({ type: 'context_compacted' }));
+            return events;
+        }
+
+        if (method === 'thread/goal/updated') {
+            const goal = asRecord(paramsRecord.goal);
+            const threadId = asString(paramsRecord.threadId ?? paramsRecord.thread_id ?? goal?.threadId ?? goal?.thread_id);
+            if (!threadId || !goal) {
+                return events;
+            }
+            const turnId = asString(paramsRecord.turnId ?? paramsRecord.turn_id);
+            events.push({
+                type: 'thread_goal_updated',
+                thread_id: threadId,
+                ...(turnId ? { turn_id: turnId } : {}),
+                goal
+            });
+            return events;
+        }
+
+        if (method === 'thread/goal/cleared') {
+            const threadId = asString(paramsRecord.threadId ?? paramsRecord.thread_id ?? eventScope.thread_id);
+            if (!threadId) {
+                return events;
+            }
+            events.push({
+                type: 'thread_goal_cleared',
+                thread_id: threadId
+            });
             return events;
         }
 
@@ -795,6 +893,24 @@ export class AppServerEventConverter {
                 return events;
             }
 
+            if (itemType === 'imagegeneration') {
+                if (method === 'item/completed') {
+                    const savedPath = extractGeneratedImagePath(item);
+                    if (!savedPath) {
+                        logger.debug('[AppServerEventConverter] imageGeneration missing savedPath', sanitizeUnhandledNotificationLogValue({ item }));
+                        return events;
+                    }
+                    events.push(scoped({
+                        type: 'generated_image',
+                        image_id: itemId,
+                        saved_path: savedPath,
+                        file_name: extractGeneratedImageFileName(item, savedPath),
+                        ...(extractGeneratedImageMimeType(item) ? { mime_type: extractGeneratedImageMimeType(item) } : {})
+                    }));
+                }
+                return events;
+            }
+
             if (itemType === 'collabagenttoolcall') {
                 const toolName = normalizeCollabAgentToolName(item.tool ?? item.name);
                 if (!toolName) return events;
@@ -865,7 +981,7 @@ export class AppServerEventConverter {
             return newEvents;
         }
 
-        logger.debug('[AppServerEventConverter] Unhandled notification', { method, params });
+        logger.debug('[AppServerEventConverter] Unhandled notification', sanitizeUnhandledNotificationLogValue({ method, params }));
         return events;
     }
 

@@ -5,12 +5,24 @@ import type { EnhancedMode } from './loop';
 const harness = vi.hoisted(() => ({
     notifications: [] as Array<{ method: string; params: unknown }>,
     registerRequestCalls: [] as string[],
+    requestHandlers: new Map<string, (params: unknown) => Promise<unknown> | unknown>(),
     initializeCalls: [] as unknown[],
+    setFeatureEnablementCalls: [] as unknown[],
+    failSetFeatureEnablement: false,
+    listCollaborationModeCalls: 0,
+    collaborationModeResponse: { data: [{ mode: 'default' }, { mode: 'plan' }] } as unknown,
+    failListCollaborationModes: false,
     startThreadIds: [] as string[],
     resumeThreadIds: [] as string[],
     startTurnThreadIds: [] as string[],
+    startTurnParams: [] as Array<Record<string, unknown>>,
+    startTurnErrors: [] as Error[],
     interruptedTurns: [] as Array<{ threadId: string; turnId: string }>,
     compactThreadIds: [] as string[],
+    goalSetCalls: [] as unknown[],
+    goalGetCalls: [] as unknown[],
+    goalClearCalls: [] as unknown[],
+    goal: null as Record<string, unknown> | null,
     suppressTurnCompletion: false,
     remainingThreadSystemErrors: 0,
     startTurnMessages: [] as string[],
@@ -20,7 +32,14 @@ const harness = vi.hoisted(() => ({
     deferThreadStatusNotifications: false,
     emitChildThreadEvents: false,
     emitChildUsageEvents: false,
+    emitChildGoalEvent: false,
     emitChildReasoningBurst: false,
+    emitChildDoneStatusWithoutMessage: false,
+    emitChildWaitStructuredOutput: false,
+    emitChildTaskCompleteBeforeMessage: false,
+    suppressChildTaskCompleteEvent: false,
+    emitSecondChildMessage: false,
+    emitLateChildCommandAfterParentTool: false,
     emitParentUsageEvents: false,
     emitChildNestedAgentTool: false,
     emitParentTitleChange: false,
@@ -28,6 +47,9 @@ const harness = vi.hoisted(() => ({
     emitParentSpawnStartWithoutEnd: false,
     emitParentSendInputFailure: false,
     emitParentResumeSuccess: false,
+    emitRunningChildTurnBeforeSuppressedParent: false,
+    emitCompletedChildTurnBeforeSuppressedParent: false,
+    emitTurnAbortedOnInterrupt: false,
     bridgeOptions: [] as unknown[]
 }));
 
@@ -46,8 +68,25 @@ vi.mock('./codexAppServerClient', () => {
             this.notificationHandler = handler;
         }
 
-        registerRequestHandler(method: string): void {
+        async listCollaborationModes(): Promise<unknown> {
+            harness.listCollaborationModeCalls += 1;
+            if (harness.failListCollaborationModes) {
+                throw new Error('collaborationMode/list failed');
+            }
+            return harness.collaborationModeResponse;
+        }
+
+        async setExperimentalFeatureEnablement(params: unknown): Promise<unknown> {
+            harness.setFeatureEnablementCalls.push(params);
+            if (harness.failSetFeatureEnablement) {
+                throw new Error('unsupported feature enablement');
+            }
+            return params;
+        }
+
+        registerRequestHandler(method: string, handler: (params: unknown) => Promise<unknown> | unknown): void {
             harness.registerRequestCalls.push(method);
+            harness.requestHandlers.set(method, handler);
         }
 
         async startThread(): Promise<{ thread: { id: string }; model: string }> {
@@ -78,7 +117,48 @@ vi.mock('./codexAppServerClient', () => {
             return {};
         }
 
+        async setThreadGoal(params?: { threadId?: string; objective?: string; status?: string }): Promise<{ goal: Record<string, unknown> }> {
+            harness.goalSetCalls.push(params ?? {});
+            const threadId = params?.threadId ?? 'thread-unknown';
+            harness.goal = {
+                threadId,
+                objective: params?.objective ?? harness.goal?.objective ?? 'existing goal',
+                status: params?.status ?? 'active',
+                tokenBudget: null,
+                tokensUsed: 0,
+                timeUsedSeconds: 0,
+                createdAt: 1,
+                updatedAt: 2
+            };
+            const notification = { threadId, goal: harness.goal };
+            harness.notifications.push({ method: 'thread/goal/updated', params: notification });
+            this.notificationHandler?.('thread/goal/updated', notification);
+            return { goal: harness.goal };
+        }
+
+        async getThreadGoal(params?: { threadId?: string }): Promise<{ goal: Record<string, unknown> | null }> {
+            harness.goalGetCalls.push(params ?? {});
+            return { goal: harness.goal };
+        }
+
+        async clearThreadGoal(params?: { threadId?: string }): Promise<{ cleared: boolean }> {
+            harness.goalClearCalls.push(params ?? {});
+            const cleared = harness.goal !== null;
+            harness.goal = null;
+            if (cleared) {
+                const notification = { threadId: params?.threadId ?? 'thread-unknown' };
+                harness.notifications.push({ method: 'thread/goal/cleared', params: notification });
+                this.notificationHandler?.('thread/goal/cleared', notification);
+            }
+            return { cleared };
+        }
+
         async startTurn(params?: { threadId?: string; input?: Array<{ text?: string }>; message?: string; userMessage?: string }): Promise<{ turn: { id?: string } }> {
+            harness.startTurnParams.push((params ?? {}) as Record<string, unknown>);
+            const nextError = harness.startTurnErrors.shift();
+            if (nextError) {
+                throw nextError;
+            }
             const threadId = params?.threadId ?? 'thread-unknown';
             harness.startTurnThreadIds.push(threadId);
             harness.startTurnMessages.push(params?.input?.[0]?.text ?? params?.message ?? params?.userMessage ?? '');
@@ -101,6 +181,33 @@ vi.mock('./codexAppServerClient', () => {
                     notify();
                 }
                 return { turn: { id: turnId } };
+            }
+
+            if (
+                harness.emitRunningChildTurnBeforeSuppressedParent
+                || harness.emitCompletedChildTurnBeforeSuppressedParent
+            ) {
+                const childStarted = {
+                    msg: {
+                        type: 'task_started',
+                        thread_id: 'child-thread',
+                        turn_id: 'child-turn'
+                    }
+                };
+                harness.notifications.push({ method: 'codex/event/task_started', params: childStarted });
+                this.notificationHandler?.('codex/event/task_started', childStarted);
+
+                if (harness.emitCompletedChildTurnBeforeSuppressedParent) {
+                    const childCompleted = {
+                        msg: {
+                            type: 'task_complete',
+                            thread_id: 'child-thread',
+                            turn_id: 'child-turn'
+                        }
+                    };
+                    harness.notifications.push({ method: 'codex/event/task_complete', params: childCompleted });
+                    this.notificationHandler?.('codex/event/task_complete', childCompleted);
+                }
             }
 
             if (harness.suppressTurnCompletion) {
@@ -228,6 +335,19 @@ vi.mock('./codexAppServerClient', () => {
                 const childThreadId = 'child-thread';
                 const childTurnId = 'child-turn';
                 const childMessage = 'child output should stay hidden';
+                const secondChildMessage = 'final child output should win';
+
+                const emitChildDone = () => {
+                    const childDone = {
+                        msg: {
+                            type: 'task_complete',
+                            thread_id: childThreadId,
+                            turn_id: childTurnId
+                        }
+                    };
+                    harness.notifications.push({ method: 'codex/event/task_complete', params: childDone });
+                    this.notificationHandler?.('codex/event/task_complete', childDone);
+                };
 
                 if (harness.emitChildReasoningBurst) {
                     for (let i = 0; i < 20; i += 1) {
@@ -245,6 +365,10 @@ vi.mock('./codexAppServerClient', () => {
                     }
                 }
 
+                if (harness.emitChildDoneStatusWithoutMessage && harness.emitChildTaskCompleteBeforeMessage) {
+                    emitChildDone();
+                }
+
                 const childMessageCompleted = {
                     item: {
                         id: 'child-msg-1',
@@ -256,6 +380,28 @@ vi.mock('./codexAppServerClient', () => {
                 };
                 harness.notifications.push({ method: 'item/completed', params: childMessageCompleted });
                 this.notificationHandler?.('item/completed', childMessageCompleted);
+
+                if (harness.emitSecondChildMessage) {
+                    const secondChildMessageCompleted = {
+                        item: {
+                            id: 'child-msg-2',
+                            type: 'agentMessage',
+                            content: [{ type: 'text', text: secondChildMessage }]
+                        },
+                        threadId: childThreadId,
+                        turnId: childTurnId
+                    };
+                    harness.notifications.push({ method: 'item/completed', params: secondChildMessageCompleted });
+                    this.notificationHandler?.('item/completed', secondChildMessageCompleted);
+                }
+
+                if (
+                    harness.emitChildDoneStatusWithoutMessage
+                    && !harness.emitChildTaskCompleteBeforeMessage
+                    && !harness.suppressChildTaskCompleteEvent
+                ) {
+                    emitChildDone();
+                }
 
                 if (harness.emitChildUsageEvents) {
                     const childUsage = {
@@ -292,6 +438,24 @@ vi.mock('./codexAppServerClient', () => {
                     };
                     harness.notifications.push({ method: 'thread/tokenUsage/updated', params: ambiguousUsage });
                     this.notificationHandler?.('thread/tokenUsage/updated', ambiguousUsage);
+                }
+
+                if (harness.emitChildGoalEvent) {
+                    const childGoal = {
+                        threadId: childThreadId,
+                        goal: {
+                            threadId: childThreadId,
+                            objective: 'child-only goal',
+                            status: 'active',
+                            tokenBudget: null,
+                            tokensUsed: 0,
+                            timeUsedSeconds: 0,
+                            createdAt: 1,
+                            updatedAt: 2
+                        }
+                    };
+                    harness.notifications.push({ method: 'thread/goal/updated', params: childGoal });
+                    this.notificationHandler?.('thread/goal/updated', childGoal);
                 }
 
                 const childCommandStart = {
@@ -413,8 +577,15 @@ vi.mock('./codexAppServerClient', () => {
                         receiverThreadIds: [childThreadId],
                         agentsStates: {
                             [childThreadId]: {
-                                status: 'completed',
-                                message: childMessage
+                                status: harness.emitChildDoneStatusWithoutMessage ? 'done' : 'completed',
+                                message: harness.emitChildWaitStructuredOutput
+                                    ? ''
+                                    : harness.emitChildDoneStatusWithoutMessage
+                                        ? null
+                                        : harness.emitSecondChildMessage
+                                            ? secondChildMessage
+                                            : childMessage,
+                                ...(harness.emitChildWaitStructuredOutput ? { output: { value: 42 } } : {})
                             }
                         }
                     },
@@ -489,6 +660,20 @@ vi.mock('./codexAppServerClient', () => {
                     harness.notifications.push({ method: 'item/completed', params: resumeCompleted });
                     this.notificationHandler?.('item/completed', resumeCompleted);
                 }
+
+                if (harness.emitLateChildCommandAfterParentTool) {
+                    const lateChildCommandStart = {
+                        item: {
+                            id: 'late-child-cmd',
+                            type: 'commandExecution',
+                            command: 'echo late'
+                        },
+                        threadId: childThreadId,
+                        turnId: childTurnId
+                    };
+                    harness.notifications.push({ method: 'item/started', params: lateChildCommandStart });
+                    this.notificationHandler?.('item/started', lateChildCommandStart);
+                }
             }
 
             const completed = { status: 'Completed', turn: { id: turnId } };
@@ -499,10 +684,19 @@ vi.mock('./codexAppServerClient', () => {
         }
 
         async interruptTurn(params?: { threadId?: string; turnId?: string }): Promise<Record<string, never>> {
-            harness.interruptedTurns.push({
-                threadId: params?.threadId ?? 'thread-unknown',
-                turnId: params?.turnId ?? 'turn-unknown'
-            });
+            const threadId = params?.threadId ?? 'thread-unknown';
+            const turnId = params?.turnId ?? 'turn-unknown';
+            harness.interruptedTurns.push({ threadId, turnId });
+            if (harness.emitTurnAbortedOnInterrupt) {
+                const interrupted = {
+                    threadId,
+                    turnId,
+                    status: 'interrupted',
+                    turn: { id: turnId }
+                };
+                harness.notifications.push({ method: 'turn/completed', params: interrupted });
+                this.notificationHandler?.('turn/completed', interrupted);
+            }
             return {};
         }
 
@@ -552,17 +746,18 @@ type FakeAgentState = {
 function createMode(): EnhancedMode {
     return {
         permissionMode: 'default',
-        collaborationMode: 'default'
+        collaborationMode: 'default',
+        model: 'gpt-5.4'
     };
 }
 
-function createSessionStub(messages = ['hello from launcher test']) {
+function createSessionStub(messages = ['hello from launcher test'], mode = createMode()) {
     const queue = new MessageQueue2<EnhancedMode>((mode) => JSON.stringify(mode));
     messages.forEach((message, index) => {
         if (index === 0 && messages.length > 1) {
-            queue.pushIsolateAndClear(message, createMode());
+            queue.pushIsolateAndClear(message, mode);
         } else {
-            queue.push(message, createMode());
+            queue.push(message, mode);
         }
     });
     queue.close();
@@ -573,7 +768,9 @@ function createSessionStub(messages = ['hello from launcher test']) {
     const thinkingChanges: boolean[] = [];
     const foundSessionIds: string[] = [];
     const resetThreadCalls: string[] = [];
-    let currentModel: string | null | undefined;
+    const collaborationModes: Array<EnhancedMode['collaborationMode'] | undefined> = [];
+    let currentModel: string | null | undefined = mode.model;
+    let currentCollaborationMode: EnhancedMode['collaborationMode'] | undefined = mode.collaborationMode;
     let agentState: FakeAgentState = {
         requests: {},
         completedRequests: {}
@@ -619,6 +816,13 @@ function createSessionStub(messages = ['hello from launcher test']) {
         getModel() {
             return currentModel;
         },
+        getCollaborationMode() {
+            return currentCollaborationMode;
+        },
+        setCollaborationMode(nextMode: EnhancedMode['collaborationMode']) {
+            currentCollaborationMode = nextMode;
+            collaborationModes.push(nextMode);
+        },
         onThinkingChange(nextThinking: boolean) {
             session.thinking = nextThinking;
             thinkingChanges.push(nextThinking);
@@ -652,6 +856,8 @@ function createSessionStub(messages = ['hello from launcher test']) {
         resetThreadCalls,
         rpcHandlers,
         getModel: () => currentModel,
+        getCollaborationMode: () => currentCollaborationMode,
+        collaborationModes,
         getAgentState: () => agentState
     };
 }
@@ -660,12 +866,24 @@ describe('codexRemoteLauncher', () => {
     afterEach(() => {
         harness.notifications = [];
         harness.registerRequestCalls = [];
+        harness.requestHandlers = new Map();
         harness.initializeCalls = [];
+        harness.setFeatureEnablementCalls = [];
+        harness.failSetFeatureEnablement = false;
+        harness.listCollaborationModeCalls = 0;
+        harness.collaborationModeResponse = { data: [{ mode: 'default' }, { mode: 'plan' }] };
+        harness.failListCollaborationModes = false;
         harness.startThreadIds = [];
         harness.resumeThreadIds = [];
         harness.startTurnThreadIds = [];
+        harness.startTurnParams = [];
+        harness.startTurnErrors = [];
         harness.interruptedTurns = [];
         harness.compactThreadIds = [];
+        harness.goalSetCalls = [];
+        harness.goalGetCalls = [];
+        harness.goalClearCalls = [];
+        harness.goal = null;
         harness.suppressTurnCompletion = false;
         harness.startTurnMessages = [];
         harness.failResumeThreadIds = [];
@@ -675,7 +893,14 @@ describe('codexRemoteLauncher', () => {
         harness.deferThreadStatusNotifications = false;
         harness.emitChildThreadEvents = false;
         harness.emitChildUsageEvents = false;
+        harness.emitChildGoalEvent = false;
         harness.emitChildReasoningBurst = false;
+        harness.emitChildDoneStatusWithoutMessage = false;
+        harness.emitChildWaitStructuredOutput = false;
+        harness.emitChildTaskCompleteBeforeMessage = false;
+        harness.suppressChildTaskCompleteEvent = false;
+        harness.emitSecondChildMessage = false;
+        harness.emitLateChildCommandAfterParentTool = false;
         harness.emitParentUsageEvents = false;
         harness.emitChildNestedAgentTool = false;
         harness.emitParentTitleChange = false;
@@ -683,6 +908,9 @@ describe('codexRemoteLauncher', () => {
         harness.emitParentSpawnStartWithoutEnd = false;
         harness.emitParentSendInputFailure = false;
         harness.emitParentResumeSuccess = false;
+        harness.emitRunningChildTurnBeforeSuppressedParent = false;
+        harness.emitCompletedChildTurnBeforeSuppressedParent = false;
+        harness.emitTurnAbortedOnInterrupt = false;
         harness.bridgeOptions = [];
     });
 
@@ -709,6 +937,7 @@ describe('codexRemoteLauncher', () => {
                 experimentalApi: true
             }
         }]);
+        expect(harness.setFeatureEnablementCalls).toEqual([{ enablement: { goals: true } }]);
         expect(harness.notifications.map((entry) => entry.method)).toEqual([
             'turn/started',
             'item/started',
@@ -718,6 +947,224 @@ describe('codexRemoteLauncher', () => {
         expect(sessionEvents.filter((event) => event.type === 'ready').length).toBeGreaterThanOrEqual(1);
         expect(thinkingChanges).toContain(true);
         expect(session.thinking).toBe(false);
+    });
+
+    it('sends Codex plan collaboration mode when the app-server advertises it', async () => {
+        const { session } = createSessionStub(['plan this'], {
+            permissionMode: 'default',
+            collaborationMode: 'plan',
+            model: 'gpt-5.4'
+        });
+
+        const exitReason = await codexRemoteLauncher(session as never);
+
+        expect(exitReason).toBe('exit');
+        expect(harness.listCollaborationModeCalls).toBe(1);
+        expect(harness.startTurnParams).toHaveLength(1);
+        expect(harness.startTurnParams[0]?.collaborationMode).toMatchObject({
+            mode: 'plan',
+            settings: {
+                model: 'gpt-5.4'
+            }
+        });
+        expect(harness.startTurnParams[0]?.model).toBeUndefined();
+    });
+
+    it('recognizes name-only plan collaboration mode entries', async () => {
+        harness.collaborationModeResponse = { data: [{ name: 'plan' }] };
+        const { session } = createSessionStub(['plan this'], {
+            permissionMode: 'default',
+            collaborationMode: 'plan',
+            model: 'gpt-5.4'
+        });
+
+        const exitReason = await codexRemoteLauncher(session as never);
+
+        expect(exitReason).toBe('exit');
+        expect(harness.startTurnParams).toHaveLength(1);
+        expect(harness.startTurnParams[0]?.collaborationMode).toMatchObject({
+            mode: 'plan'
+        });
+    });
+
+    it('recognizes alternate collaboration mode list envelopes', async () => {
+        harness.collaborationModeResponse = { collaborationModes: [{ id: 'plan' }] };
+        const { session } = createSessionStub(['plan this'], {
+            permissionMode: 'default',
+            collaborationMode: 'plan',
+            model: 'gpt-5.4'
+        });
+
+        const exitReason = await codexRemoteLauncher(session as never);
+
+        expect(exitReason).toBe('exit');
+        expect(harness.startTurnParams).toHaveLength(1);
+        expect(harness.startTurnParams[0]?.collaborationMode).toMatchObject({
+            mode: 'plan'
+        });
+    });
+
+    it('retries plan turns without collaborationMode when the runtime rejects the field', async () => {
+        harness.startTurnErrors.push(new Error('unknown field collaborationMode'));
+        const { session, sessionEvents } = createSessionStub(['plan this'], {
+            permissionMode: 'default',
+            collaborationMode: 'plan',
+            model: 'gpt-5.4'
+        });
+
+        const exitReason = await codexRemoteLauncher(session as never);
+
+        expect(exitReason).toBe('exit');
+        expect(harness.startTurnParams).toHaveLength(2);
+        expect(harness.startTurnParams[0]?.collaborationMode).toMatchObject({
+            mode: 'plan'
+        });
+        expect(harness.startTurnParams[1]?.collaborationMode).toBeUndefined();
+        expect(harness.startTurnParams[1]?.model).toBe('gpt-5.4');
+        expect(sessionEvents).toContainEqual({
+            type: 'message',
+            message: 'Plan mode is not supported by this Codex runtime. Sent as a normal turn instead.'
+        });
+    });
+
+    it('retries plan turns when unsupported errors use spaced collaboration mode wording', async () => {
+        harness.startTurnErrors.push(new Error('unsupported collaboration mode'));
+        const { session, sessionEvents } = createSessionStub(['plan this'], {
+            permissionMode: 'default',
+            collaborationMode: 'plan',
+            model: 'gpt-5.4'
+        });
+
+        const exitReason = await codexRemoteLauncher(session as never);
+
+        expect(exitReason).toBe('exit');
+        expect(harness.startTurnParams).toHaveLength(2);
+        expect(harness.startTurnParams[0]?.collaborationMode).toMatchObject({
+            mode: 'plan'
+        });
+        expect(harness.startTurnParams[1]?.collaborationMode).toBeUndefined();
+        expect(sessionEvents).toContainEqual({
+            type: 'message',
+            message: 'Plan mode is not supported by this Codex runtime. Sent as a normal turn instead.'
+        });
+    });
+
+    it('does not retry unrelated collaborationMode errors as normal turns', async () => {
+        harness.startTurnErrors.push(new Error('collaborationMode value failed policy validation'));
+        const { session, sessionEvents } = createSessionStub(['plan this'], {
+            permissionMode: 'default',
+            collaborationMode: 'plan',
+            model: 'gpt-5.4'
+        });
+
+        const exitReason = await codexRemoteLauncher(session as never);
+
+        expect(exitReason).toBe('exit');
+        expect(harness.startTurnParams).toHaveLength(1);
+        expect(sessionEvents).not.toContainEqual({
+            type: 'message',
+            message: 'Plan mode is not supported by this Codex runtime. Sent as a normal turn instead.'
+        });
+        expect(sessionEvents).toContainEqual({
+            type: 'message',
+            message: 'Process exited unexpectedly'
+        });
+    });
+
+    it('still attempts plan mode when collaborationMode/list omits plan', async () => {
+        harness.collaborationModeResponse = { data: [{ mode: 'default' }] };
+        const { session, sessionEvents } = createSessionStub(['plan this'], {
+            permissionMode: 'default',
+            collaborationMode: 'plan',
+            model: 'gpt-5.4'
+        });
+
+        const exitReason = await codexRemoteLauncher(session as never);
+
+        expect(exitReason).toBe('exit');
+        expect(harness.startTurnParams).toHaveLength(1);
+        expect(harness.startTurnParams[0]?.collaborationMode).toMatchObject({
+            mode: 'plan'
+        });
+        expect(sessionEvents).not.toContainEqual({
+            type: 'message',
+            message: 'Plan mode is not supported by this Codex runtime. Sent as a normal turn instead.'
+        });
+    });
+
+    it('sets a Codex goal without starting a normal turn', async () => {
+        const { session, sessionEvents, codexMessages, foundSessionIds } = createSessionStub(['/goal improve benchmark coverage']);
+
+        const exitReason = await codexRemoteLauncher(session as never);
+
+        expect(exitReason).toBe('exit');
+        expect(foundSessionIds).toEqual(['thread-1']);
+        expect(harness.startTurnParams).toHaveLength(0);
+        expect(harness.goalSetCalls).toEqual([{
+            threadId: 'thread-1',
+            objective: 'improve benchmark coverage',
+            status: 'active'
+        }]);
+        expect(sessionEvents).toContainEqual({
+            type: 'message',
+            message: 'Goal active'
+        });
+        expect(codexMessages).toEqual(expect.arrayContaining([
+            expect.objectContaining({
+                type: 'thread_goal_updated',
+                thread_id: 'thread-1',
+                goal: expect.objectContaining({
+                    objective: 'improve benchmark coverage',
+                    status: 'active'
+                })
+            })
+        ]));
+    });
+
+    it('shows unsupported message when goals feature cannot be enabled', async () => {
+        harness.failSetFeatureEnablement = true;
+        const { session, sessionEvents } = createSessionStub(['/goal improve benchmark coverage']);
+
+        const exitReason = await codexRemoteLauncher(session as never);
+
+        expect(exitReason).toBe('exit');
+        expect(harness.goalSetCalls).toHaveLength(0);
+        expect(harness.startTurnParams).toHaveLength(0);
+        expect(sessionEvents).toContainEqual({
+            type: 'message',
+            message: 'Codex goals are not supported by this Codex runtime. Upgrade Codex or enable features.goals.'
+        });
+    });
+
+    it('switches collaboration mode to default after approving exit_plan_mode', async () => {
+        const { session, rpcHandlers, collaborationModes, getCollaborationMode } = createSessionStub(['plan this'], {
+            permissionMode: 'default',
+            collaborationMode: 'plan',
+            model: 'gpt-5.4'
+        });
+
+        const running = codexRemoteLauncher(session as never);
+        await vi.waitFor(() => {
+            expect(harness.requestHandlers.has('item/tool/requestApproval')).toBe(true);
+            expect(rpcHandlers.has('permission')).toBe(true);
+        });
+
+        const approvalHandler = harness.requestHandlers.get('item/tool/requestApproval');
+        const approvalPromise = approvalHandler?.({
+            itemId: 'exit-1',
+            toolName: 'exit_plan_mode',
+            input: { plan: '1. Edit files' }
+        });
+        await vi.waitFor(() => {
+            expect(rpcHandlers.has('permission')).toBe(true);
+        });
+        await rpcHandlers.get('permission')?.({ id: 'exit-1', approved: true, decision: 'approved' });
+
+        await expect(approvalPromise).resolves.toEqual({ decision: 'accept' });
+        await running;
+
+        expect(collaborationModes).toContain('default');
+        expect(getCollaborationMode()).toBe('default');
     });
 
     it('surfaces thread-level systemError only after same-thread retries are exhausted', async () => {
@@ -972,6 +1419,108 @@ describe('codexRemoteLauncher', () => {
         }));
     });
 
+    it('keeps the child final message as result when wait_agent only reports done', async () => {
+        harness.emitChildThreadEvents = true;
+        harness.emitChildDoneStatusWithoutMessage = true;
+        const { session, codexMessages } = createSessionStub();
+
+        await codexRemoteLauncher(session as never);
+
+        const completedUpdates = codexMessages.filter((message) => {
+            const record = message as Record<string, unknown>;
+            return record.type === 'agent-run-update'
+                && record.agentId === 'child-thread'
+                && record.status === 'completed';
+        }) as Array<Record<string, unknown>>;
+
+        expect(completedUpdates).toContainEqual(expect.objectContaining({
+            result: 'child output should stay hidden',
+            activity: 'Completed: child output should stay hidden'
+        }));
+        expect(completedUpdates).not.toContainEqual(expect.objectContaining({
+            result: expect.objectContaining({
+                status: 'done'
+            })
+        }));
+    });
+
+    it('fills wait_agent done without message from the latest child message', async () => {
+        harness.emitChildThreadEvents = true;
+        harness.emitChildDoneStatusWithoutMessage = true;
+        harness.suppressChildTaskCompleteEvent = true;
+        harness.emitSecondChildMessage = true;
+        const { session, codexMessages } = createSessionStub();
+
+        await codexRemoteLauncher(session as never);
+
+        const completedUpdates = codexMessages.filter((message) => {
+            const record = message as Record<string, unknown>;
+            return record.type === 'agent-run-update'
+                && record.agentId === 'child-thread'
+                && record.status === 'completed';
+        }) as Array<Record<string, unknown>>;
+        const lastCompleted = completedUpdates.at(-1);
+
+        expect(lastCompleted).toEqual(expect.objectContaining({
+            result: 'final child output should win',
+            activity: 'Completed: final child output should win'
+        }));
+    });
+
+    it('preserves wait_agent structured output when status message is empty', async () => {
+        harness.emitChildThreadEvents = true;
+        harness.emitChildWaitStructuredOutput = true;
+        harness.suppressChildTaskCompleteEvent = true;
+        const { session, codexMessages } = createSessionStub();
+
+        await codexRemoteLauncher(session as never);
+
+        const completedUpdates = codexMessages.filter((message) => {
+            const record = message as Record<string, unknown>;
+            return record.type === 'agent-run-update'
+                && record.agentId === 'child-thread'
+                && record.status === 'completed';
+        }) as Array<Record<string, unknown>>;
+        const lastCompleted = completedUpdates.at(-1);
+
+        expect(lastCompleted).toEqual(expect.objectContaining({
+            result: { value: 42 },
+            activity: 'Completed: {"value":42}'
+        }));
+    });
+
+    it('does not regress a completed child agent to running when message arrives late', async () => {
+        harness.emitChildThreadEvents = true;
+        harness.emitChildDoneStatusWithoutMessage = true;
+        harness.emitChildTaskCompleteBeforeMessage = true;
+        const { session, codexMessages } = createSessionStub();
+
+        await codexRemoteLauncher(session as never);
+
+        const terminalIndex = codexMessages.findIndex((message) => {
+            const record = message as Record<string, unknown>;
+            return record.type === 'agent-run-update'
+                && record.agentId === 'child-thread'
+                && record.status === 'completed';
+        });
+        expect(terminalIndex).toBeGreaterThanOrEqual(0);
+
+        const laterUpdates = codexMessages.slice(terminalIndex + 1).filter((message) => {
+            const record = message as Record<string, unknown>;
+            return record.type === 'agent-run-update'
+                && record.agentId === 'child-thread';
+        }) as Array<Record<string, unknown>>;
+
+        expect(laterUpdates).not.toContainEqual(expect.objectContaining({
+            status: 'running'
+        }));
+        expect(laterUpdates).toContainEqual(expect.objectContaining({
+            status: 'completed',
+            result: 'child output should stay hidden',
+            activity: 'Completed: child output should stay hidden'
+        }));
+    });
+
     it('surfaces send_input failures on the target child agent card', async () => {
         harness.emitChildThreadEvents = true;
         harness.emitParentSendInputFailure = true;
@@ -1029,6 +1578,31 @@ describe('codexRemoteLauncher', () => {
         }));
     });
 
+    it('does not regress a terminal child after resume_agent when a late command starts', async () => {
+        harness.emitChildThreadEvents = true;
+        harness.emitParentResumeSuccess = true;
+        harness.emitLateChildCommandAfterParentTool = true;
+        const { session, codexMessages } = createSessionStub();
+
+        await codexRemoteLauncher(session as never);
+
+        expect(codexMessages).toContainEqual(expect.objectContaining({
+            type: 'agent-run-trace',
+            agentId: 'child-thread',
+            message: expect.objectContaining({
+                type: 'tool-call',
+                callId: 'late-child-cmd'
+            })
+        }));
+        expect(codexMessages).not.toContainEqual(expect.objectContaining({
+            type: 'agent-run-update',
+            agentId: 'child-thread',
+            activity: 'Running command: echo late',
+            activityKind: 'running-command',
+            status: 'running'
+        }));
+    });
+
     it('throttles child agent reasoning activity updates instead of emitting one per delta', async () => {
         harness.emitChildThreadEvents = true;
         harness.emitChildReasoningBurst = true;
@@ -1076,6 +1650,19 @@ describe('codexRemoteLauncher', () => {
         }));
         expect(codexMessages).not.toContainEqual(expect.objectContaining({
             type: 'context_compacted',
+            thread_id: 'child-thread'
+        }));
+    });
+
+    it('keeps child goal events out of the parent goal stream', async () => {
+        harness.emitChildThreadEvents = true;
+        harness.emitChildGoalEvent = true;
+        const { session, codexMessages } = createSessionStub();
+
+        await codexRemoteLauncher(session as never);
+
+        expect(codexMessages).not.toContainEqual(expect.objectContaining({
+            type: 'thread_goal_updated',
             thread_id: 'child-thread'
         }));
     });
@@ -1247,6 +1834,60 @@ describe('codexRemoteLauncher', () => {
             type: 'message',
             message: 'Context was reset'
         });
+        expect(session.thinking).toBe(false);
+    });
+
+    it('interrupts active child agent turns before clearing codex thread state', async () => {
+        harness.suppressTurnCompletion = true;
+        harness.emitRunningChildTurnBeforeSuppressedParent = true;
+        const { session, resetThreadCalls } = createSessionStub(['first message', '/clear']);
+
+        const exitReason = await codexRemoteLauncher(session as never);
+
+        expect(exitReason).toBe('exit');
+        expect(harness.interruptedTurns).toEqual([
+            { threadId: 'thread-1', turnId: 'turn-1' },
+            { threadId: 'child-thread', turnId: 'child-turn' }
+        ]);
+        expect(resetThreadCalls).toEqual(['thread-1']);
+        expect(session.thinking).toBe(false);
+    });
+
+    it('interrupts active child agent turns when the abort RPC is invoked', async () => {
+        harness.suppressTurnCompletion = true;
+        harness.emitRunningChildTurnBeforeSuppressedParent = true;
+        harness.emitTurnAbortedOnInterrupt = true;
+        const { session, rpcHandlers } = createSessionStub(['first message']);
+
+        const running = codexRemoteLauncher(session as never);
+        await vi.waitFor(() => {
+            expect(harness.startTurnThreadIds).toEqual(['thread-1']);
+            expect(rpcHandlers.has('abort')).toBe(true);
+        });
+
+        await rpcHandlers.get('abort')?.({});
+        const exitReason = await running;
+
+        expect(exitReason).toBe('exit');
+        expect(harness.interruptedTurns).toEqual([
+            { threadId: 'thread-1', turnId: 'turn-1' },
+            { threadId: 'child-thread', turnId: 'child-turn' }
+        ]);
+        expect(session.thinking).toBe(false);
+    });
+
+    it('does not interrupt completed child agent turns when clearing codex thread state', async () => {
+        harness.suppressTurnCompletion = true;
+        harness.emitCompletedChildTurnBeforeSuppressedParent = true;
+        const { session, resetThreadCalls } = createSessionStub(['first message', '/clear']);
+
+        const exitReason = await codexRemoteLauncher(session as never);
+
+        expect(exitReason).toBe('exit');
+        expect(harness.interruptedTurns).toEqual([
+            { threadId: 'thread-1', turnId: 'turn-1' }
+        ]);
+        expect(resetThreadCalls).toEqual(['thread-1']);
         expect(session.thinking).toBe(false);
     });
 

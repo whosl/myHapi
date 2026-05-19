@@ -16,8 +16,11 @@ import { normalizeDecryptedMessage } from '@/chat/normalize'
 import { reduceChatBlocks } from '@/chat/reducer'
 import { reconcileChatBlocks } from '@/chat/reconcile'
 import { buildConversationOutline } from '@/chat/outline'
+import { buildVisibleChatBlocks, isToolGroupBlock, type ToolGroupBlock } from '@/chat/toolGroups'
 import { isQueuedForInvocation } from '@/lib/messages'
 import { HappyComposer } from '@/components/AssistantChat/HappyComposer'
+import type { PendingSchedule } from '@/components/AssistantChat/ScheduleTimePicker'
+import { resolvePendingSchedule } from '@/components/AssistantChat/ScheduleTimePicker'
 import { HappyThread } from '@/components/AssistantChat/HappyThread'
 import { QueuedMessagesBar } from '@/components/AssistantChat/QueuedMessagesBar'
 import { useHappyRuntime } from '@/lib/assistant-runtime'
@@ -33,6 +36,19 @@ import { useVoiceOptional } from '@/lib/voice-context'
 import { RealtimeVoiceSession, registerSessionStore, registerVoiceHooksStore, voiceHooks } from '@/realtime'
 import { isRemoteTerminalSupported } from '@/utils/terminalSupport'
 
+/**
+ * Returns whether a PendingSchedule should trigger an auto-clear timer.
+ *
+ * Only 'absolute' schedules expire (the chosen instant passes).
+ * 'preset' schedules are relative to send time and have no fixed expiry.
+ *
+ * Used both by the auto-clear useEffect and by unit tests, so a future
+ * variant of PendingSchedule only needs to update this single helper.
+ */
+export function shouldAutoClearPendingSchedule(pending: PendingSchedule | null): boolean {
+    return pending !== null && pending.type === 'absolute'
+}
+
 function getOutlineTitle(session: Session): string {
     if (session.metadata?.name) {
         return session.metadata.name
@@ -44,6 +60,23 @@ function getOutlineTitle(session: Session): string {
         return session.metadata.path
     }
     return session.id.slice(0, 8)
+}
+
+function hasAbortableAgentRun(blocks: readonly ChatBlock[]): boolean {
+    for (const block of blocks) {
+        if (block.kind === 'tool-call') {
+            if (
+                block.tool.name === 'CodexAgent'
+                && (block.tool.state === 'running' || block.tool.state === 'pending')
+            ) {
+                return true
+            }
+            if (hasAbortableAgentRun(block.children)) {
+                return true
+            }
+        }
+    }
+    return false
 }
 
 export function SessionChat(props: {
@@ -60,7 +93,11 @@ export function SessionChat(props: {
     onBack: () => void
     onRefresh: () => void
     onLoadMore: () => Promise<unknown>
-    onSend: (text: string, attachments?: AttachmentMetadata[]) => void
+    // Resolves true when the send was accepted by the underlying mutation, false when
+    // pre-mutation guards (no-api / no-session / pending) rejected the call OR async
+    // inactive-session resume failed. Composer state that should only be cleared on
+    // actual send (pendingSchedule) must await this — see handleSend below.
+    onSend: (text: string, attachments?: AttachmentMetadata[], scheduledAt?: number | null) => Promise<boolean>
     onFlushPending: () => void
     onAtBottomChange: (atBottom: boolean) => void
     onRetryMessage?: (localId: string) => void
@@ -74,6 +111,7 @@ export function SessionChat(props: {
     const terminalSupported = isRemoteTerminalSupported(props.session.metadata)
     const normalizedCacheRef = useRef<Map<string, { source: DecryptedMessage; normalized: NormalizedMessage | null }>>(new Map())
     const blocksByIdRef = useRef<Map<string, ChatBlock>>(new Map())
+    const visibleGroupsRef = useRef<ToolGroupBlock[]>([])
     const [forceScrollToken, setForceScrollToken] = useState(0)
     const [outlineOpen, setOutlineOpen] = useState(false)
     const agentFlavor = props.session.metadata?.flavor ?? null
@@ -224,6 +262,7 @@ export function SessionChat(props: {
     useEffect(() => {
         normalizedCacheRef.current.clear()
         blocksByIdRef.current.clear()
+        visibleGroupsRef.current = []
         setOutlineOpen(false)
     }, [props.session.id])
 
@@ -241,6 +280,7 @@ export function SessionChat(props: {
         if (prevSessionIdRef.current !== null && prevSessionIdRef.current !== props.session.id) {
             normalizedCacheRef.current.clear()
             blocksByIdRef.current.clear()
+            visibleGroupsRef.current = []
         }
         prevSessionIdRef.current = props.session.id
 
@@ -274,10 +314,26 @@ export function SessionChat(props: {
         () => reconcileChatBlocks(reduced.blocks, blocksByIdRef.current),
         [reduced.blocks]
     )
+    const hasRunningChildAgent = useMemo(
+        () => hasAbortableAgentRun(reduced.blocks),
+        [reduced.blocks]
+    )
 
     useEffect(() => {
         blocksByIdRef.current = reconciled.byId
     }, [reconciled.byId])
+
+    const visibleBlocks = useMemo(
+        () => buildVisibleChatBlocks(reconciled.blocks, {
+            hasMoreMessages: props.hasMoreMessages,
+            previousGroups: visibleGroupsRef.current
+        }),
+        [reconciled.blocks, props.hasMoreMessages]
+    )
+
+    useEffect(() => {
+        visibleGroupsRef.current = visibleBlocks.filter(isToolGroupBlock)
+    }, [visibleBlocks])
 
     const outlineItems = useMemo(
         () => buildConversationOutline(reconciled.blocks),
@@ -372,8 +428,42 @@ export function SessionChat(props: {
         })
     }, [navigate, props.session.id])
 
-    const handleSend = useCallback((text: string, attachments?: AttachmentMetadata[]) => {
-        props.onSend(text, attachments)
+    // Scheduled message state — lifted here so useHappyRuntime can read the ref.
+    //
+    // pendingSchedule holds what the user selected (preset or absolute ms).
+    // The ref is read at send time; resolvePendingSchedule converts it to an
+    // absolute epoch-ms using Date.now() at that moment (send-time base for presets).
+    const [pendingSchedule, setPendingSchedule] = useState<PendingSchedule | null>(null)
+    const pendingScheduleRef = useRef<PendingSchedule | null>(null)
+    // Keep render ref in sync so onNew can snapshot at send time
+    pendingScheduleRef.current = pendingSchedule
+
+    // Auto-clear absolute-type pendingSchedule when the chosen time expires so
+    // the composer clock button doesn't stay active past the scheduled instant.
+    // Preset-type schedules are relative so they don't expire until send — the
+    // shouldAutoClearPendingSchedule predicate is the single source of truth so
+    // adding a new PendingSchedule variant only needs to update that helper.
+    useEffect(() => {
+        if (!shouldAutoClearPendingSchedule(pendingSchedule)) return
+        // Narrowed to 'absolute' by the predicate above.
+        const ms = (pendingSchedule as Extract<PendingSchedule, { type: 'absolute' }>).ms
+        const remaining = ms - Date.now()
+        if (remaining <= 0) {
+            setPendingSchedule(null)
+            return
+        }
+        const timer = setTimeout(() => setPendingSchedule(null), remaining)
+        return () => clearTimeout(timer)
+    }, [pendingSchedule])
+
+    const handleSend = useCallback(async (text: string, attachments?: AttachmentMetadata[], scheduledAt?: number | null) => {
+        const accepted = await props.onSend(text, attachments, scheduledAt)
+        if (!accepted) return
+        // Clear pendingSchedule only after the mutation is actually accepted —
+        // covers both pre-mutation guards AND async inactive-session resume
+        // failure. SessionChat is the single owner of schedule clear (HappyComposer
+        // no longer clears on its own send path).
+        setPendingSchedule(null)
         setForceScrollToken((token) => token + 1)
     }, [props.onSend])
 
@@ -386,12 +476,14 @@ export function SessionChat(props: {
 
     const runtime = useHappyRuntime({
         session: props.session,
-        blocks: reconciled.blocks,
+        blocks: visibleBlocks,
         isSending: props.isSending,
+        isRunning: props.session.thinking || hasRunningChildAgent,
         onSendMessage: handleSend,
         onAbort: handleAbort,
         attachmentAdapter,
-        allowSendWhenInactive: true
+        allowSendWhenInactive: true,
+        pendingScheduleRef
     })
 
     return (
@@ -454,15 +546,26 @@ export function SessionChat(props: {
                     ) : null}
 
                     <div className="px-3">
-                        <QueuedMessagesBar sessionId={props.session.id} api={props.api} />
+                        <QueuedMessagesBar
+                            sessionId={props.session.id}
+                            api={props.api}
+                            onEdit={({ pendingSchedule: restored }) => {
+                                // Restore the schedule so the clock button re-activates
+                                setPendingSchedule(restored)
+                            }}
+                        />
                     </div>
 
                     <HappyComposer
                         key={props.session.id}
                         sessionId={props.session.id}
                         disabled={props.isSending}
+                        pendingSchedule={pendingSchedule}
+                        onSchedule={setPendingSchedule}
+                        onClearSchedule={() => setPendingSchedule(null)}
                         permissionMode={props.session.permissionMode}
                         collaborationMode={codexCollaborationModeSupported ? props.session.collaborationMode : undefined}
+                        threadGoal={reduced.latestGoal}
                         model={props.session.model}
                         modelReasoningEffort={agentFlavor === 'codex' ? props.session.modelReasoningEffort : undefined}
                         effort={props.session.effort}
