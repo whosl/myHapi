@@ -249,6 +249,75 @@ export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Ho
         }
     })
 
+    // R2 presigned upload — client uploads directly to Cloudflare R2, bypassing the tunnel.
+    const presignUploadSchema = z.object({
+        filename: z.string().min(1).max(255),
+        mimeType: z.string().min(1).max(255),
+    })
+
+    app.post('/sessions/:id/upload/presign', async (c) => {
+        const engine = requireSyncEngine(c, getSyncEngine)
+        if (engine instanceof Response) return engine
+
+        const sessionResult = requireSessionFromParam(c, engine, { requireActive: true })
+        if (sessionResult instanceof Response) return sessionResult
+
+        const body = await c.req.json().catch(() => null)
+        const parsed = presignUploadSchema.safeParse(body)
+        if (!parsed.success) return c.json({ error: 'Invalid body' }, 400)
+
+        try {
+            const { createPresignedUpload } = await import('../../storage/r2Storage')
+            const presigned = await createPresignedUpload(
+                sessionResult.sessionId,
+                parsed.data.filename,
+                parsed.data.mimeType,
+            )
+            return c.json({ success: true, ...presigned })
+        } catch (error) {
+            return c.json({
+                success: false,
+                error: error instanceof Error ? error.message : 'Failed to create upload URL',
+            }, 500)
+        }
+    })
+
+    // Client reports a completed R2 upload — hub stores the R2 key as an attachment.
+    const r2UploadCompleteSchema = z.object({
+        key: z.string().min(1),
+        filename: z.string().min(1).max(255),
+        mimeType: z.string().min(1).max(255),
+    })
+
+    app.post('/sessions/:id/upload/r2-complete', async (c) => {
+        const engine = requireSyncEngine(c, getSyncEngine)
+        if (engine instanceof Response) return engine
+
+        const sessionResult = requireSessionFromParam(c, engine, { requireActive: true })
+        if (sessionResult instanceof Response) return sessionResult
+
+        const body = await c.req.json().catch(() => null)
+        const parsed = r2UploadCompleteSchema.safeParse(body)
+        if (!parsed.success) return c.json({ error: 'Invalid body' }, 400)
+
+        try {
+            const { getPresignedDownloadUrl } = await import('../../storage/r2Storage')
+            const url = await getPresignedDownloadUrl(parsed.data.key)
+            return c.json({
+                success: true,
+                path: url,
+                key: parsed.data.key,
+                filename: parsed.data.filename,
+                mimeType: parsed.data.mimeType,
+            })
+        } catch (error) {
+            return c.json({
+                success: false,
+                error: error instanceof Error ? error.message : 'Failed to confirm upload',
+            }, 500)
+        }
+    })
+
     app.post('/sessions/:id/abort', async (c) => {
         const engine = requireSyncEngine(c, getSyncEngine)
         if (engine instanceof Response) {

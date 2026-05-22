@@ -3,6 +3,8 @@ import type {
     AuthResponse,
     CodexCollaborationMode,
     DeleteUploadResponse,
+    PresignUploadResponse,
+    R2UploadCompleteResponse,
     ListDirectoryResponse,
     FileReadResponse,
     FileSearchResponse,
@@ -306,6 +308,20 @@ export class ApiClient {
         return await this.request<DeleteUploadResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/upload/delete`, {
             method: 'POST',
             body: JSON.stringify({ path })
+        })
+    }
+
+    async presignUpload(sessionId: string, filename: string, mimeType: string): Promise<PresignUploadResponse> {
+        return await this.request<PresignUploadResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/upload/presign`, {
+            method: 'POST',
+            body: JSON.stringify({ filename, mimeType })
+        })
+    }
+
+    async confirmR2Upload(sessionId: string, key: string, filename: string, mimeType: string): Promise<R2UploadCompleteResponse> {
+        return await this.request<R2UploadCompleteResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/upload/r2-complete`, {
+            method: 'POST',
+            body: JSON.stringify({ key, filename, mimeType })
         })
     }
 
