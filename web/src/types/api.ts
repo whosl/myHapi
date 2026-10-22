@@ -172,6 +172,24 @@ export type DeleteUploadResponse = {
     error?: string
 }
 
+export type PresignUploadResponse = {
+    success: boolean
+    uploadUrl?: string
+    key?: string
+    publicUrl?: string
+    expiresIn?: number
+    error?: string
+}
+
+export type R2UploadCompleteResponse = {
+    success: boolean
+    path?: string
+    key?: string
+    filename?: string
+    mimeType?: string
+    error?: string
+}
+
 export type GitFileStatus = {
     fileName: string
     filePath: string

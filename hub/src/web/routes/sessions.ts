@@ -1,6 +1,7 @@
 import { getPermissionModesForFlavor, isPermissionModeAllowedForFlavor, supportsModelChange, toSessionSummary } from '@hapi/protocol'
 import { CodexCollaborationModeSchema, PermissionModeSchema } from '@hapi/protocol/schemas'
 import { Hono } from 'hono'
+import * as r2Storage from '../../storage/r2Storage'
 import { z } from 'zod'
 import type { SyncEngine, Session } from '../../sync/syncEngine'
 import type { WebAppEnv } from '../middleware/auth'
@@ -95,7 +96,7 @@ function estimateBase64Bytes(base64: string): number {
     return Math.floor((len * 3) / 4) - padding
 }
 
-export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Hono<WebAppEnv> {
+export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null, storage = r2Storage): Hono<WebAppEnv> {
     const app = new Hono<WebAppEnv>()
 
     app.get('/sessions', (c) => {
@@ -246,6 +247,98 @@ export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Ho
                 success: false,
                 error: error instanceof Error ? error.message : 'Failed to delete upload'
             }, 500)
+        }
+    })
+
+    // R2 presigned upload — client uploads directly to Cloudflare R2, bypassing the tunnel.
+    const presignUploadSchema = z.object({
+        filename: z.string().min(1).max(255),
+        mimeType: z.string().min(1).max(255),
+    })
+
+    app.post('/sessions/:id/upload/presign', async (c) => {
+        const engine = requireSyncEngine(c, getSyncEngine)
+        if (engine instanceof Response) return engine
+
+        const sessionResult = requireSessionFromParam(c, engine, { requireActive: true })
+        if (sessionResult instanceof Response) return sessionResult
+
+        const body = await c.req.json().catch(() => null)
+        const parsed = presignUploadSchema.safeParse(body)
+        if (!parsed.success) return c.json({ error: 'Invalid body' }, 400)
+
+        try {
+            const { createPresignedUpload } = storage
+            const presigned = await createPresignedUpload(
+                sessionResult.sessionId,
+                parsed.data.filename,
+                parsed.data.mimeType,
+            )
+            return c.json({ success: true, ...presigned })
+        } catch (error) {
+            return c.json({
+                success: false,
+                error: error instanceof Error ? error.message : 'Failed to create upload URL',
+            }, 500)
+        }
+    })
+
+    // Materialize R2 uploads on the agent machine; attachment paths must remain local.
+    const r2UploadCompleteSchema = z.object({
+        key: z.string().min(1),
+        filename: z.string().min(1).max(255),
+        mimeType: z.string().min(1).max(255),
+    })
+
+    app.post('/sessions/:id/upload/r2-complete', async (c) => {
+        const engine = requireSyncEngine(c, getSyncEngine)
+        if (engine instanceof Response) return engine
+
+        const sessionResult = requireSessionFromParam(c, engine, { requireActive: true })
+        if (sessionResult instanceof Response) return sessionResult
+
+        const body = await c.req.json().catch(() => null)
+        const parsed = r2UploadCompleteSchema.safeParse(body)
+        if (!parsed.success) return c.json({ error: 'Invalid body' }, 400)
+
+        try {
+            if (!storage.isSessionUploadKey(sessionResult.sessionId, parsed.data.key)) {
+                return c.json({ error: 'Invalid upload key' }, 400)
+            }
+            const { readUpload } = storage
+            const content = await readUpload(parsed.data.key, MAX_UPLOAD_BYTES)
+            const result = await engine.uploadFile(sessionResult.sessionId, parsed.data.filename, content, parsed.data.mimeType)
+            if (!result.success || !result.path) return c.json(result)
+            return c.json({
+                success: true,
+                path: result.path,
+                key: parsed.data.key,
+                filename: parsed.data.filename,
+                mimeType: parsed.data.mimeType,
+            })
+        } catch (error) {
+            return c.json({
+                success: false,
+                error: error instanceof Error ? error.message : 'Failed to confirm upload',
+            }, 500)
+        }
+    })
+
+    app.post('/sessions/:id/upload/r2-delete', async (c) => {
+        const engine = requireSyncEngine(c, getSyncEngine)
+        if (engine instanceof Response) return engine
+        const sessionResult = requireSessionFromParam(c, engine)
+        if (sessionResult instanceof Response) return sessionResult
+        const parsed = z.object({ key: z.string().min(1) }).safeParse(await c.req.json().catch(() => null))
+        if (!parsed.success || !storage.isSessionUploadKey(sessionResult.sessionId, parsed.data.key)) {
+            return c.json({ error: 'Invalid upload key' }, 400)
+        }
+        try {
+            const { deleteUpload } = storage
+            await deleteUpload(parsed.data.key)
+            return c.json({ success: true })
+        } catch (error) {
+            return c.json({ success: false, error: error instanceof Error ? error.message : 'Failed to delete R2 upload' }, 500)
         }
     })
 
