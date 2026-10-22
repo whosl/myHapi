@@ -16,9 +16,13 @@ type PendingUploadAttachment = PendingAttachment & {
 export function createAttachmentAdapter(api: ApiClient, sessionId: string): AttachmentAdapter {
     const cancelledAttachmentIds = new Set<string>()
 
-    const deleteUpload = async (path?: string) => {
-        if (!path) return
-        try { await api.deleteUploadFile(sessionId, path) } catch { /* best effort */ }
+    const deleteUpload = async (path?: string, r2Key?: string) => {
+        if (path) {
+            try { await api.deleteUploadFile(sessionId, path) } catch { /* best effort */ }
+        }
+        if (r2Key) {
+            try { await api.deleteR2Upload(sessionId, r2Key) } catch { /* best effort */ }
+        }
     }
 
     return {
@@ -31,6 +35,9 @@ export function createAttachmentAdapter(api: ApiClient, sessionId: string): Atta
             yield { id, type: 'file', name: file.name, contentType, file,
                 status: { type: 'running', reason: 'uploading', progress: 0 } }
 
+            let path: string | undefined
+            let r2Key: string | undefined
+            let delivered = false
             try {
                 if (cancelledAttachmentIds.has(id)) return
                 if (file.size > MAX_UPLOAD_BYTES) {
@@ -39,32 +46,34 @@ export function createAttachmentAdapter(api: ApiClient, sessionId: string): Atta
                     return
                 }
 
-                // Try R2 presigned upload first; fall back to base64 via hub on any failure
-                let path: string | undefined
-                let r2Key: string | undefined
-
+                // Try R2 presigned upload first; fall back to base64 via hub on any failure.
                 try {
                     const presign = await api.presignUpload(sessionId, file.name, contentType)
-                    if (presign.success && presign.uploadUrl) {
-                        yield { id, type: 'file', name: file.name, contentType, file,
-                            status: { type: 'running', reason: 'uploading', progress: 30 } }
+                    if (presign.success && presign.uploadUrl && presign.key) {
+                        r2Key = presign.key
+                        if (cancelledAttachmentIds.has(id)) return
 
                         const uploadResp = await fetch(presign.uploadUrl, {
                             method: 'PUT', body: file,
                             headers: { 'Content-Type': contentType },
                         })
                         if (uploadResp.ok) {
-                            yield { id, type: 'file', name: file.name, contentType, file,
-                                status: { type: 'running', reason: 'uploading', progress: 80 } }
+                            if (cancelledAttachmentIds.has(id)) return
 
-                            const confirmed = await api.confirmR2Upload(sessionId, presign.key!, file.name, contentType)
+                            const confirmed = await api.confirmR2Upload(sessionId, presign.key, file.name, contentType)
                             if (confirmed.success && confirmed.path) {
                                 path = confirmed.path
-                                r2Key = presign.key!
+                                r2Key = presign.key
                             }
                         }
                     }
                 } catch { /* fall through to base64 */ }
+
+                if (cancelledAttachmentIds.has(id)) return
+                if (!path && r2Key) {
+                    await deleteUpload(undefined, r2Key)
+                    r2Key = undefined
+                }
 
                 // Fallback: base64 upload via hub
                 if (!path) {
@@ -74,11 +83,10 @@ export function createAttachmentAdapter(api: ApiClient, sessionId: string): Atta
                     yield { id, type: 'file', name: file.name, contentType, file,
                         status: { type: 'running', reason: 'uploading', progress: 50 } }
 
+                    if (cancelledAttachmentIds.has(id)) return
                     const result = await api.uploadFile(sessionId, file.name, content, contentType)
-                    if (cancelledAttachmentIds.has(id)) {
-                        if (result.success && result.path) await deleteUpload(result.path)
-                        return
-                    }
+                    if (result.success) path = result.path
+                    if (cancelledAttachmentIds.has(id)) return
                     if (!result.success || !result.path) {
                         yield { id, type: 'file', name: file.name, contentType, file,
                             status: { type: 'incomplete', reason: 'error' } }
@@ -92,21 +100,28 @@ export function createAttachmentAdapter(api: ApiClient, sessionId: string): Atta
                     previewUrl = await fileToDataUrl(file)
                 }
 
+                if (cancelledAttachmentIds.has(id)) return
+                delivered = true
                 yield {
                     id, type: 'file', name: file.name, contentType, file,
                     status: { type: 'requires-action', reason: 'composer-send' },
                     path, r2Key, previewUrl
                 } as PendingUploadAttachment
             } catch {
-                yield { id, type: 'file', name: file.name, contentType, file,
-                    status: { type: 'incomplete', reason: 'error' } }
+                if (!cancelledAttachmentIds.has(id)) {
+                    yield { id, type: 'file', name: file.name, contentType, file,
+                        status: { type: 'incomplete', reason: 'error' } }
+                }
+            } finally {
+                if (!delivered) await deleteUpload(path, r2Key)
+                cancelledAttachmentIds.delete(id)
             }
         },
 
         async remove(attachment: Attachment): Promise<void> {
             cancelledAttachmentIds.add(attachment.id)
             const path = (attachment as PendingUploadAttachment).path
-            await deleteUpload(path)
+            await deleteUpload(path, (attachment as PendingUploadAttachment).r2Key)
         },
 
         async send(attachment: PendingAttachment): Promise<CompleteAttachment> {

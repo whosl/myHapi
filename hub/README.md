@@ -24,6 +24,12 @@ See `src/configuration.ts` for all options.
 - `TELEGRAM_BOT_TOKEN` - Token from @BotFather.
 - `HAPI_PUBLIC_URL` - Public HTTPS URL for Telegram Mini App access. Also used to derive default CORS origins for the web app.
 
+### Optional (R2 attachment uploads)
+
+Set `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, and `R2_BUCKET_NAME` to enable direct browser uploads. Configure bucket CORS to allow the web origin to PUT with `Content-Type`. Without R2 configuration, attachments use the existing base64 upload route.
+
+R2 confirmation copies the object to the agent machine through the upload RPC and returns that local path. Removing an attachment deletes both its local file and its session-scoped R2 key.
+
 ### Optional (Voice)
 
 - `ELEVENLABS_API_KEY` - ElevenLabs API key for voice assistant.

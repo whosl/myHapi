@@ -311,6 +311,13 @@ export class ApiClient {
         })
     }
 
+    async deleteR2Upload(sessionId: string, key: string): Promise<DeleteUploadResponse> {
+        return await this.request<DeleteUploadResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/upload/r2-delete`, {
+            method: 'POST',
+            body: JSON.stringify({ key })
+        })
+    }
+
     async presignUpload(sessionId: string, filename: string, mimeType: string): Promise<PresignUploadResponse> {
         return await this.request<PresignUploadResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/upload/presign`, {
             method: 'POST',
